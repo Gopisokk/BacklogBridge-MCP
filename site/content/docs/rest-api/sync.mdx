@@ -131,3 +131,4 @@ Anything else closes the socket: another text message, a binary frame, a frame o
 The server sends a ping every 30 seconds. Browsers and WebSocket libraries answer pings on their own, so a client that only listens stays connected with no code of its own. A socket that answers nothing for 120 seconds is closed. Sending `heartbeat` also counts as an answer.
 
 These events cover writes made through the running server, over REST, MCP or the web UI. Local CLI commands and local stdio MCP write the database file directly and do not produce events; clients pick those changes up on their next refetch or `/changes` call.
+

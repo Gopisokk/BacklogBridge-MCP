@@ -125,7 +125,7 @@
   >
     <div class="px-3 pt-3 pb-2 flex items-center gap-1.5">
       <a
-        href="https://lific.dev"
+        href="https://github.com/Gopisokk/BacklogBridge-MCP"
         target="_blank"
         rel="noopener noreferrer"
         title="Lific"

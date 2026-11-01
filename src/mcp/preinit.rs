@@ -5,7 +5,7 @@
 //! `ServerInitializeError::ExpectedInitializeRequest` and the session dies with
 //! no reply, so a discovery-capable client reads EOF mid-handshake instead of a
 //! JSON-RPC error it could fall back from (`client is closing: EOF`). See
-//! https://github.com/VoidNullable/lific/issues/57.
+//! https://github.com/Gopisokk/BacklogBridge-MCP/issues/57.
 //!
 //! This transport hands rmcp a stream that swallows pre-initialize traffic rmcp
 //! would abort on, and answers unsupported requests itself with `-32601`
@@ -130,3 +130,4 @@ where
 
 #[cfg(test)]
 mod tests;
+

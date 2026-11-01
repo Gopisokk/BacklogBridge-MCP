@@ -10,7 +10,7 @@ let inflight: Promise<string | null> | null = null;
 function fetchLatestVersion(): Promise<string | null> {
   if (cachedVersion !== null) return Promise.resolve(cachedVersion);
   inflight ??= fetch(
-    "https://api.github.com/repos/VoidNullable/lific/releases/latest",
+    "https://api.github.com/repos/Gopisokk/BacklogBridge-MCP/releases/latest",
     { headers: { Accept: "application/vnd.github+json" } },
   )
     .then((r) => (r.ok ? r.json() : null))
@@ -55,3 +55,4 @@ export function VersionChip() {
     </span>
   );
 }
+

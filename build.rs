@@ -90,7 +90,7 @@ fn main() {
     } else {
         if matches!(std::env::var("PROFILE").as_deref(), Ok("release" | "dist")) {
             panic!(
-                "web/dist/index.html is missing or empty; build the frontend first with `devenv tasks run lific:web:build`, or enable the `build-web` feature to build it with Bun during the Cargo build (for example `cargo install --git https://github.com/VoidNullable/lific --locked --features build-web`)"
+                "web/dist/index.html is missing or empty; build the frontend first with `devenv tasks run lific:web:build`, or enable the `build-web` feature to build it with Bun during the Cargo build (for example `cargo install --git https://github.com/Gopisokk/BacklogBridge-MCP --locked --features build-web`)"
             );
         }
         source_dist
@@ -277,3 +277,4 @@ mod tests {
         );
     }
 }
+

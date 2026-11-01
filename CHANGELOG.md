@@ -6,7 +6,7 @@ A web UI fix for issue previews.
 
 ### Web UI
 
-- Issue hover cards opened from links inside a page or issue body now show in full, instead of being clipped or pushed off the edge of the surrounding panel. Those links also stop showing a native browser tooltip on top of the card (PR #99 by [@zorro432](https://github.com/zorro432)).
+- Issue hover cards opened from links inside a page or issue body now show in full, instead of being clipped or pushed off the edge of the surrounding panel. Those links also stop showing a native browser tooltip on top of the card (PR #99 by @zorro432).
 
 ## v2.11.0 (2026-10-13)
 
@@ -14,8 +14,8 @@ This release does three things. `cargo install lific` builds again, after an ups
 
 ### Installing
 
-- `cargo install lific` builds again. 2.10.0 allowed any 1.x version of `rmcp`, and `cargo install` ignores `Cargo.lock`, so a fresh install picked up rmcp 1.8, whose API change broke the build on every platform ([#92](https://github.com/VoidNullable/lific/issues/92)). Lific now holds rmcp at 1.4, and CI checks every push and a weekly schedule against a fresh dependency resolution. Release binaries and `--locked` installs were never affected.
-- The macOS release binary no longer refers to a Nix store copy of libiconv, so it starts on Macs without Nix (PR #84 by [@mjc](https://github.com/mjc)).
+- `cargo install lific` builds again. 2.10.0 allowed any 1.x version of `rmcp`, and `cargo install` ignores `Cargo.lock`, so a fresh install picked up rmcp 1.8, whose API change broke the build on every platform ([#92](https://github.com/Gopisokk/BacklogBridge-MCP/issues/92)). Lific now holds rmcp at 1.4, and CI checks every push and a weekly schedule against a fresh dependency resolution. Release binaries and `--locked` installs were never affected.
+- The macOS release binary no longer refers to a Nix store copy of libiconv, so it starts on Macs without Nix (PR #84 by @mjc).
 - Debug builds on Windows no longer overflow the stack before printing `--version`.
 
 ### Who does an issue
@@ -30,21 +30,21 @@ This release does three things. `cargo install lific` builds again, after an ups
 - Pages over 30,000 characters come back as an outline with section sizes. `section` reads one section, `offset` continues a cut read, and `since_seq` returns only what changed since an earlier read. Page writes say when content has grown past that budget.
 - `create_issue` takes an `issues` array to file up to 50 issues in one transaction, and lists up to three similar open issues after filing.
 - `update_issue` accepts `evidence` when closing an issue, stored as a verification comment. Issues with task lists show checklist progress, and closing one with unchecked items warns.
-- `list_issues` with `members: ["me"]` lists your issues across every project where you hold a role, and `statuses` takes several statuses at once. `list_resources` shows each project's roles, members and per-status counts (PR #91 by [@magnusfjeldolsen](https://github.com/magnusfjeldolsen)).
+- `list_issues` with `members: ["me"]` lists your issues across every project where you hold a role, and `statuses` takes several statuses at once. `list_resources` shows each project's roles, members and per-status counts (PR #91 by @magnusfjeldolsen).
 - `get_activity` reads forward from a `since` cursor. A project `export` returns the documents themselves, paged, instead of server file paths.
 - Search falls back to ranked any-word matches, marked as partial, when no result contains every word.
-- Every tool rejects unknown parameters with a did-you-mean error. The edit tools also accept camelCase `oldString`/`newString`, names given with quotes or HTML entities (`&amp;`) resolve, and `manage_resource` accepts single- or double-quoted names (PR #88 by [@mjc](https://github.com/mjc)).
+- Every tool rejects unknown parameters with a did-you-mean error. The edit tools also accept camelCase `oldString`/`newString`, names given with quotes or HTML entities (`&amp;`) resolve, and `manage_resource` accepts single- or double-quoted names (PR #88 by @mjc).
 - `update_plan_step` without a `step_id` now adds a top-level step, instead of reporting success and doing nothing. Fields sent to the wrong target are refused.
-- Attachments arrive over stdio, including the remote and multi-instance proxies, as embedded MCP resources. HTTP MCP returns absolute download links (PRs #81 and #82 by [@mjc](https://github.com/mjc)).
+- Attachments arrive over stdio, including the remote and multi-instance proxies, as embedded MCP resources. HTTP MCP returns absolute download links (PRs #81 and #82 by @mjc).
 - Published tool schemas and descriptions are about 30 percent shorter. All 31 tools now cost an agent 5,781 tokens of context.
-- HTTP MCP no longer serializes requests behind one lock, so many agents at once no longer stall each other or the web UI (PR #83 by [@mjc](https://github.com/mjc)).
+- HTTP MCP no longer serializes requests behind one lock, so many agents at once no longer stall each other or the web UI (PR #83 by @mjc).
 
 ### Projects and pages
 
 - Archive a project from its danger zone. Its data is written to one compressed file beside the database and the project is removed. An instance admin can restore it from Settings, Instance, with members and authorship intact. Dumps, backups and restores carry archived projects.
 - Tick task-list checkboxes in a rendered issue or page without opening the editor.
-- Add and remove issue relations from the issue view, and link or unlink issues from the CLI (PR #96 by [@lardissone](https://github.com/lardissone)). The relation picker also finds issues in other projects you can see.
-- Legacy Hangul Word Processor (`.hwp`) files can be attached. They are checked against the file format and always downloaded, never rendered (PR #65 by [@teracokr](https://github.com/teracokr)).
+- Add and remove issue relations from the issue view, and link or unlink issues from the CLI (PR #96 by @lardissone). The relation picker also finds issues in other projects you can see.
+- Legacy Hangul Word Processor (`.hwp`) files can be attached. They are checked against the file format and always downloaded, never rendered (PR #65 by @teracokr).
 - In the command palette, a bare number like `34` opens that issue in the current project first.
 
 ### Backups
@@ -54,13 +54,13 @@ This release does three things. `cargo install lific` builds again, after an ups
 
 ### Security
 
-- API keys are checked with a SHA-256 verifier instead of Argon2. Existing keys are converted on their next successful use (PR #67 by [@mjc](https://github.com/mjc)).
-- A key bound to a user that no longer resolves is refused instead of falling back to operator access. Rotating a key keeps its owner and expiry, an expired key cannot be renewed by rotating it, and `lific connect` will not write an expired credential into a client's configuration (PR #66 by [@mjc](https://github.com/mjc)).
+- API keys are checked with a SHA-256 verifier instead of Argon2. Existing keys are converted on their next successful use (PR #67 by @mjc).
+- A key bound to a user that no longer resolves is refused instead of falling back to operator access. Rotating a key keeps its owner and expiry, an expired key cannot be renewed by rotating it, and `lific connect` will not write an expired credential into a client's configuration (PR #66 by @mjc).
 - Issue reads, boards and exports leave out relations to issues in projects the caller cannot view. Previously they named those issues and, in `get_issue`, their status.
 
 ### Fixes
 
-- A status change from the list or the board stays put. Previously, the card could snap back to its old column until the page was refreshed, permanently so when the browser had no realtime connection, such as behind a proxy that does not forward WebSocket upgrades ([#98](https://github.com/VoidNullable/lific/issues/98), reported by [@rokups](https://github.com/rokups)).
+- A status change from the list or the board stays put. Previously, the card could snap back to its old column until the page was refreshed, permanently so when the browser had no realtime connection, such as behind a proxy that does not forward WebSocket upgrades ([#98](https://github.com/Gopisokk/BacklogBridge-MCP/issues/98), reported by @rokups).
 - `lific init --here` creates its database instead of failing after writing the config, and its closing message describes the account it actually created.
 - The server starts one async worker per CPU, capped at 8, so large machines no longer spend startup on idle workers. `TOKIO_WORKER_THREADS` overrides the cap.
 
@@ -82,13 +82,13 @@ A hardening release. Public projects get firmer limits and a spoof-resistant way
 
 ### MCP
 
-- `edit_comment` now supports exact string replacement with `old_string` and `new_string` (plus `replace_all`), the same contract as `edit_issue` and `edit_page`. Passing `content` still replaces the whole body. A call must choose one mode, and unknown parameters are rejected, so an agent that guesses the contract wrong gets an error instead of a comment reduced to the snippet it sent ([#64](https://github.com/VoidNullable/lific/issues/64), reported by [@bgie](https://github.com/bgie)).
-- The stdio server answers a `server/discover` request sent before `initialize` with a method-not-found error and keeps running, instead of exiting. Newer MCP clients that probe first can now connect (PR #58 by [@bgie](https://github.com/bgie)).
-- Server instructions now show the correct argument names for listing projects and plans and for `get_plan` (PR #63 by [@mjc](https://github.com/mjc)).
+- `edit_comment` now supports exact string replacement with `old_string` and `new_string` (plus `replace_all`), the same contract as `edit_issue` and `edit_page`. Passing `content` still replaces the whole body. A call must choose one mode, and unknown parameters are rejected, so an agent that guesses the contract wrong gets an error instead of a comment reduced to the snippet it sent ([#64](https://github.com/Gopisokk/BacklogBridge-MCP/issues/64), reported by @bgie).
+- The stdio server answers a `server/discover` request sent before `initialize` with a method-not-found error and keeps running, instead of exiting. Newer MCP clients that probe first can now connect (PR #58 by @bgie).
+- Server instructions now show the correct argument names for listing projects and plans and for `get_plan` (PR #63 by @mjc).
 
 ### Public projects and security
 
-- A reverse proxy listed in `server.trusted_proxies` can pass the client address in `X-Lific-Client-IP`, authenticated with `X-Lific-Proxy-Secret` against the new `LIFIC_TRUSTED_PROXY_SECRET` environment variable. A trusted peer that sends either header without a valid pair gets `503` on rate-limited routes, rather than every visitor sharing the proxy's rate-limit bucket. Forwarded-header handling is otherwise unchanged (PR #59 by [@mjc](https://github.com/mjc)).
+- A reverse proxy listed in `server.trusted_proxies` can pass the client address in `X-Lific-Client-IP`, authenticated with `X-Lific-Proxy-Secret` against the new `LIFIC_TRUSTED_PROXY_SECRET` environment variable. A trusted peer that sends either header without a valid pair gets `503` on rate-limited routes, rather than every visitor sharing the proxy's rate-limit bucket. Forwarded-header handling is otherwise unchanged (PR #59 by @mjc).
 - Public attachment downloads have their own budget of four concurrent streams, so slow readers cannot starve ordinary public reads. Public thumbnail and preview derivation runs one at a time to stay inside small deployments' memory. Excess requests get `503` with `Retry-After`.
 - Every response now carries `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, a `Content-Security-Policy` of `frame-ancestors 'none'; base-uri 'self'; object-src 'none'`, and `Cross-Origin-Resource-Policy: same-origin`, including OAuth consent pages. Lific can no longer be embedded in another site's frame.
 - Mermaid diagram limits can no longer be bypassed with semicolon-separated statements, comments, or titled equal-axis chart ranges, each of which could make a viewer's browser do unbounded work. Quoted labels and ordinary ranges still render.
@@ -102,7 +102,7 @@ A hardening release. Public projects get firmer limits and a spoof-resistant way
 
 ### Builds and releases
 
-- The Windows release binary is built for `x86_64-pc-windows-msvc` and smoke-tested on Windows before publication. The download name is unchanged (PRs #60 and #61 by [@mjc](https://github.com/mjc)).
+- The Windows release binary is built for `x86_64-pc-windows-msvc` and smoke-tested on Windows before publication. The download name is unchanged (PRs #60 and #61 by @mjc).
 - Release builds now fail unless the web UI has been built, so a release binary can no longer ship without its interface. Development builds are unaffected.
 - Development and release builds use a pinned [Devenv](https://devenv.sh) environment. See the installation guide for building from source.
 
@@ -132,7 +132,7 @@ Lific can now associate a repository with its project, route one agent connectio
 
 With multiple backends, writes require an explicit `instance`; allowlisted reads may use a default. Failed calls never redirect elsewhere. Results identify their source alias. A synthetic `list_instances` tool reports hosts, authentication state and repository bindings without revealing credentials.
 
-Startup requires exactly matching complete tool definitions across all backends, including descriptions, annotations and schemas. Even a wording difference fails. This mode routes tools, not MCP resources or prompts. See [multi-instance MCP](https://github.com/VoidNullable/lific/blob/v2.9.0/docs/multi-instance-mcp.md) for configuration and limits.
+Startup requires exactly matching complete tool definitions across all backends, including descriptions, annotations and schemas. Even a wording difference fails. This mode routes tools, not MCP resources or prompts. See [multi-instance MCP](https://github.com/Gopisokk/BacklogBridge-MCP/blob/v2.9.0/docs/multi-instance-mcp.md) for configuration and limits.
 
 ### Complete project archives
 
@@ -143,7 +143,7 @@ Move a project with `lific project-archive export` and `import`, or download its
 - The browser allows at most 128 MiB compressed and 50,000 rows; the local CLI allows 2 GiB compressed and 200,000 rows. Expanded data and files have separate limits. Invalid relationships, unsafe paths and damaged blobs stop the import before a partial project becomes visible.
 - Browser transfers show upload progress and retain their result when you leave and return within the same tab. Losing the connection during import leaves its outcome unknown: check the project list before retrying. The server may already have committed it.
 
-Archives contain historical text removed from today's descriptions. Treat them as private data. Review the reference report and imported files before switching writers. [Project archives](https://github.com/VoidNullable/lific/blob/v2.9.0/docs/project-archives.md) documents limits and cutover.
+Archives contain historical text removed from today's descriptions. Treat them as private data. Review the reference report and imported files before switching writers. [Project archives](https://github.com/Gopisokk/BacklogBridge-MCP/blob/v2.9.0/docs/project-archives.md) documents limits and cutover.
 
 ### Public projects
 
@@ -151,7 +151,7 @@ A project lead or instance admin can enable **Public view** in the project overv
 
 Readers get the ordinary issue list, board, page tree and detail views, with filtering, sorting and project-local search. Editing and commenting controls are absent. Plans, audit history, trash, account records, membership and cross-project relations stay outside the public surface. Comments show display names, not account identifiers.
 
-Public Markdown prevents automatic third-party media loads; local attachment references use public download routes. External links remain clickable. Unpublishing stops subsequent requests, but cannot recall saved files or pages. Publication does not secure an otherwise open instance: require authentication and disable browser auto-login before exposing the server. See [public projects](https://github.com/VoidNullable/lific/blob/v2.9.0/docs/public-projects.md).
+Public Markdown prevents automatic third-party media loads; local attachment references use public download routes. External links remain clickable. Unpublishing stops subsequent requests, but cannot recall saved files or pages. Publication does not secure an otherwise open instance: require authentication and disable browser auto-login before exposing the server. See [public projects](https://github.com/Gopisokk/BacklogBridge-MCP/blob/v2.9.0/docs/public-projects.md).
 
 ### Web UI
 
@@ -162,12 +162,12 @@ Public Markdown prevents automatic third-party media loads; local attachment ref
 - Connected Tools accepts custom tools and separately named connections for the same agent. Each connection keeps its own identity and lifecycle controls; renaming the owner no longer hides stored connections.
 - The command palette answers from the current project's loaded issue and page index immediately, adding server search when local results are sparse. Late responses from an earlier query or project cannot replace the current results.
 - Issue selection has visible controls and a select-all control in the desktop sub-tab strip. Ctrl/Cmd+A selects visible list rows when the list owns the shortcut. Only titles and identifiers navigate on a plain click. Selected issues download as one Markdown file with canonical metadata and comments, capped at 16 MiB. Failed exports report an error without downloading a partial file.
-- Linked issue chips show status and refresh it as issues change (PRs #47 and #49 by [@mjc](https://github.com/mjc)). Issue detail now displays both duplicate directions. Malformed project or module icons fall back safely instead of breaking rendering.
+- Linked issue chips show status and refresh it as issues change (PRs #47 and #49 by @mjc). Issue detail now displays both duplicate directions. Malformed project or module icons fall back safely instead of breaking rendering.
 
 ### CLI, comments and recovery
 
-- CLI credential files now fail closed on malformed or unsafe data instead of treating corruption as an empty store or overwriting it. Writes use private storage and reject unsafe links (PR #51 by [@mjc](https://github.com/mjc)). Help names the API-key environment variable without printing its value.
-- `lific doctor` inspects the database without migrating it by default. `--repair` explicitly applies pending migrations. Configuration failures stay visible rather than quietly selecting the default database, and schema inspection uses one read snapshot (PR #52 by [@mjc](https://github.com/mjc), with follow-up fixes).
+- CLI credential files now fail closed on malformed or unsafe data instead of treating corruption as an empty store or overwriting it. Writes use private storage and reject unsafe links (PR #51 by @mjc). Help names the API-key environment variable without printing its value.
+- `lific doctor` inspects the database without migrating it by default. `--repair` explicitly applies pending migrations. Configuration failures stay visible rather than quietly selecting the default database, and schema inspection uses one read snapshot (PR #52 by @mjc, with follow-up fixes).
 - Local CLI content writes reconcile attachments and mentions through the same transactional query paths as REST and MCP. Local and HTTP JSON output also share web-link formatting.
 - Interactive comment pages now have a 2 MiB byte budget as well as a row limit. Continuation metadata tells clients whether more remain; a short page no longer means the thread ended. MCP measures the encoded response, including formatting. An individually oversized comment fails explicitly with continuation instructions instead of disappearing. Comment bodies allow at most 256 distinct mention tokens and 256 distinct attachment IDs; older oversized bodies can be edited without growing.
 - WebSockets revalidate credentials before protected live deliveries, cached activity reads and every replay frame. Account recovery performed through the CLI therefore stops delivery without waiting for the idle revalidation timer. Enabling auto-login through the CLI now applies the same exposure checks as the web API; disabling it remains available for recovery.
@@ -184,7 +184,7 @@ For containers, explicit `start --init-if-missing` supports first boot on an emp
 
 ### Development
 
-CLI process-contract tests cover help, completion, output and exit behavior (PR #53 by [@mjc](https://github.com/mjc)). MCP contract tests check parameter naming, required definitions and README coverage. CI now runs frontend unit tests, browser archive round-trips, public-project isolation, and sidebar, mobile-navigation and context-menu contracts. Documentation navigation, local links and the MCP tool count are checked on pull requests as well as pushes.
+CLI process-contract tests cover help, completion, output and exit behavior (PR #53 by @mjc). MCP contract tests check parameter naming, required definitions and README coverage. CI now runs frontend unit tests, browser archive round-trips, public-project isolation, and sidebar, mobile-navigation and context-menu contracts. Documentation navigation, local links and the MCP tool count are checked on pull requests as well as pushes.
 
 ### Upgrading
 
@@ -196,7 +196,7 @@ CLI process-contract tests cover help, completion, output and exit behavior (PR 
 
 ## v2.8.0 (2026-08-30)
 
-The web UI stops treating the server as something to ask again and again and starts treating it as something to stay in sync with: every change carries a sequence number, tabs replay what they missed, navigation renders from a live read model instead of refetching, and deletes became reversible on the server. Around that, the OAuth consent screen finally says who is asking for what, and [@mjc](https://github.com/mjc) contributed another hardening pass across imports, rendered content, restores, filesystem writes, and the toolchain itself.
+The web UI stops treating the server as something to ask again and again and starts treating it as something to stay in sync with: every change carries a sequence number, tabs replay what they missed, navigation renders from a live read model instead of refetching, and deletes became reversible on the server. Around that, the OAuth consent screen finally says who is asking for what, and @mjc contributed another hardening pass across imports, rendered content, restores, filesystem writes, and the toolchain itself.
 
 ### Live sync
 
@@ -208,7 +208,7 @@ The web UI stops treating the server as something to ask again and again and sta
 
 ### OAuth consent
 
-Approving an OAuth client used to happen on a screen that could not tell you what you were approving. It said "An application wants to access your Lific issue tracker" no matter who was asking, and the device flow showed whatever name the requesting program had typed into its request. Both paths now resolve a registered client first and say who it is, and neither grants anything without an explicit yes. Most of this was contributed by [@mjc](https://github.com/mjc) in PR #41.
+Approving an OAuth client used to happen on a screen that could not tell you what you were approving. It said "An application wants to access your Lific issue tracker" no matter who was asking, and the device flow showed whatever name the requesting program had typed into its request. Both paths now resolve a registered client first and say who it is, and neither grants anything without an explicit yes. Most of this was contributed by @mjc in PR #41.
 
 - **The authorization screen names what it is about.** It shows the registered client's name, the exact address you will be redirected to, the capability being granted, how long the resulting token lives, and which account is about to grant it. A request whose client or redirect URI is not registered is refused before the page renders, so a crafted link cannot produce a plausible screen for a client that does not exist.
 - **Approve and Deny are both explicit.** A submission carrying neither is rejected instead of being read as consent. Denial redirects with `access_denied` and never creates an authorization code.
@@ -222,7 +222,7 @@ Approving an OAuth client used to happen on a screen that could not tell you wha
 
 ### Security and robustness
 
-Five more pull requests by [@mjc](https://github.com/mjc), each closing off a way the server could be made to do unbounded or unsafe work.
+Five more pull requests by @mjc, each closing off a way the server could be made to do unbounded or unsafe work.
 
 - **GitHub imports are bounded** (PR #40). Response bodies, issue and comment counts, retained memory, and concurrent import admission all have ceilings now, and hitting a deliberate ceiling returns 413 naming the limit instead of an opaque 500.
 - **Anonymous OAuth state cannot grow without bound** (PR #39). Client registrations and device codes have hard caps, size limits on their metadata, and expiry cleanup, so an unauthenticated visitor cannot fill the database.
@@ -244,7 +244,7 @@ Five more pull requests by [@mjc](https://github.com/mjc), each closing off a wa
 
 ### Development
 
-- **The toolchain now enforces what reviews used to catch.** CI and a pre-commit hook run `cargo fmt --check` and a repo-wide Clippy deny-list of selected pedantic and nursery lints (PRs #44 and #46 by [@mjc](https://github.com/mjc)). The whole-tree reformat is recorded in `.git-blame-ignore-revs`, so `git blame` still points at the commits that meant something.
+- **The toolchain now enforces what reviews used to catch.** CI and a pre-commit hook run `cargo fmt --check` and a repo-wide Clippy deny-list of selected pedantic and nursery lints (PRs #44 and #46 by @mjc). The whole-tree reformat is recorded in `.git-blame-ignore-revs`, so `git blame` still points at the commits that meant something.
 
 ### Upgrading
 
@@ -270,7 +270,7 @@ A hotfix for a crash that made v2.7.0 unusable. Upgrade immediately if you are o
 
 Two things Lific only sketched are finished in this release. Attachments stop being download chips: you can annotate a screenshot before it uploads, read a text file or a diff or a zip or a database without leaving the issue, and see every file a project holds in one place. And a project's blocking structure becomes something you can look at and edit, on a graph canvas where dragging one issue onto another links them. Around those: instance admins can manage members without shell access, the activity feed shows real diffs, the issue list points at what moved while you were away, and the CLI's remote backend reaches parity with the local one.
 
-The other half of this release is a security and robustness pass, most of it contributed by [@mjc](https://github.com/mjc) across eight pull requests. Account recovery now revokes everything an account can act through rather than just its browser sessions. Every surface that could return an unbounded result, comment threads and search and exports and websocket traffic, is now bounded. And a long list of authorization checks that were being made against the wrong thing are now made against the right one. Several of these change a default or refuse a request that used to succeed, so read the Upgrading section before deploying this one.
+The other half of this release is a security and robustness pass, most of it contributed by @mjc across eight pull requests. Account recovery now revokes everything an account can act through rather than just its browser sessions. Every surface that could return an unbounded result, comment threads and search and exports and websocket traffic, is now bounded. And a long list of authorization checks that were being made against the wrong thing are now made against the right one. Several of these change a default or refuse a request that used to succeed, so read the Upgrading section before deploying this one.
 
 ### Attachments
 
@@ -322,12 +322,12 @@ The other half of this release is a security and robustness pass, most of it con
 
 - **Project identifiers resolve case-insensitively.** `lific issue list --project lif`, `get_issue("lif-42")`, and every other project, issue, or page lookup across the CLI, REST, and MCP now accept any casing, matching how modules, folders, and usernames have always behaved. As a consequence, creating a project `abc` when `ABC` exists is now rejected. Existing databases with case-colliding identifiers (only possible via raw SQL) are renamed deterministically on upgrade.
 
-### Security: credential transport and imports (PR #27 by [@mjc](https://github.com/mjc))
+### Security: credential transport and imports (PR #27 by @mjc)
 
 - **The CLI refuses to send an API key over plaintext HTTP to a remote host.** What used to be a warning is now an error, and the error message never echoes the key. Loopback targets still work over plain HTTP, and unauthenticated plain-HTTP connections still warn rather than fail.
 - **Jira import validates the site name before sending credentials anywhere.** The site slug becomes the hostname of every request, so a hostile value could have steered your Atlassian token to a host an attacker controls. It is now constrained to a single DNS-label-shaped slug, and the canonical slug is used consistently for both requests and imported identities.
 
-### Security: account recovery (PR #32 by [@mjc](https://github.com/mjc))
+### Security: account recovery (PR #32 by @mjc)
 
 Changing your password used to end your other browser sessions and nothing else. Every other way into the account survived it: the API keys, the OAuth sessions, the connected AI tools, and any long-running agent process already holding a token. Recovery now means what people assume it means.
 
@@ -352,7 +352,7 @@ Changing your password used to end your other browser sessions and nothing else.
 - **Reconnecting a tool after a recovery works again.** API key names are unique across the whole instance, and a revoked key kept its name reserved, so reconnecting the tool whose key had just been revoked failed on a database constraint. A name held only by a revoked key is now released when its **own owner** claims it again. An active key of the same name is still refused, a name another account's revoked key still holds is refused rather than taken, and a connected tool's live credential is never rotated out from under it.
 - **The web UI no longer strands itself after a password change.** It now adopts the replacement session the server returns, states the full consequence next to both actions, and asks for confirmation before signing out everywhere. Connected tools are re-read after a password change so they show as disconnected rather than claiming to still be connected.
 
-### Security: authorization boundaries (PR #31 and PR #33 by [@mjc](https://github.com/mjc))
+### Security: authorization boundaries (PR #31 and PR #33 by @mjc)
 
 A set of checks that were being made against the wrong thing: the object rather than the project that owns it, the request's opening snapshot rather than the state at the moment of the write, or the bind address rather than where the instance can actually be reached from.
 
@@ -367,7 +367,7 @@ A set of checks that were being made against the wrong thing: the object rather 
 - **Passwordless mode is guarded on reachability, not on the bind address.** Turning authentication off, or enabling web auto-login, was allowed whenever the bind host looked local. That is the wrong question when something in front of the server publishes it: an instance bound to `127.0.0.1` and served to the internet through Tailscale Funnel or a same-host reverse proxy passed the check while being fully public. The guard now considers `public_url` as well, and enabling auto-login on an instance that declares a public URL is refused with a 400 and not persisted.
 - **Authorization is re-read inside the transaction that acts on it.** Both the granting side and the taking-away side: an admin demoted while a request was in flight can no longer complete an access-expanding write on the strength of the snapshot taken when the request arrived, and reaching another account's API key, demoting somebody, or deactivating an account all re-check the caller at the moment they act.
 
-### Comments (PR #34 by [@mjc](https://github.com/mjc))
+### Comments (PR #34 by @mjc)
 
 - **A comment body is capped at 256 KiB.** The limit is checked after Lific normalizes escaped newlines and tabs, so it bounds what actually lands in the database rather than what was typed. A create or edit past it is rejected and leaves the stored comment untouched. Comments already larger than the cap stay readable, and editing one down to a smaller body works.
 - **No surface returns an unbounded comment thread any more.** Every comment list is a page of at most 500. REST keeps its documented `order=asc` default and now defaults to `limit=50`; the MCP `list_comments` tool and `lific comment list` default to the 50 *newest*, which is the half of a long thread anyone actually wants. The MCP tool and the CLI print the exact offset for the next page when one exists, and the CLI says so explicitly when a remote lookup could not determine whether more comments follow, rather than letting a full page read as a finished thread.
@@ -380,21 +380,21 @@ A set of checks that were being made against the wrong thing: the object rather 
 
 The comment bounds above are one instance of a pattern this release works through everywhere: a request whose cost is set by the caller rather than by the server. Three more surfaces had the same shape.
 
-**Live updates (PR #28 by [@mjc](https://github.com/mjc)).** A single account could open as many websockets as it liked, each one a task, a receiver, and a file descriptor, and per-account accounting would not have bounded the instance anyway. Inbound messages had no size limit, so a large frame was a large allocation in the parser. Worst of all, an outbound `send` had no timeout, so a peer that stopped reading held its socket, its task, and its permit open indefinitely, and even the close frame could hang.
+**Live updates (PR #28 by @mjc).** A single account could open as many websockets as it liked, each one a task, a receiver, and a file descriptor, and per-account accounting would not have bounded the instance anyway. Inbound messages had no size limit, so a large frame was a large allocation in the parser. Worst of all, an outbound `send` had no timeout, so a peer that stopped reading held its socket, its task, and its permit open indefinitely, and even the close frame could hang.
 
 - Sockets are capped at 16 per user and 1,024 for the instance, held as RAII permits and released when the connection actually ends. A refused connection gets a 429.
 - A client message is capped at 16 KiB and a single frame at 4 KiB, and a client may send 64 messages per 10 seconds.
 - Every outbound send, the close frame included, times out after 5 seconds and drops the connection.
 - **Passive clients stop being disconnected.** Liveness used to depend on the application sending its own heartbeat, which nothing documented, so a client that simply listened was dropped after 120 seconds. The server now sends protocol-level pings every 30 seconds, and a conforming client stays connected without doing anything.
 
-**Search (PR #30 by [@mjc](https://github.com/mjc)).** Visibility was applied after ranking and paging rather than before, and combined entity-plus-attachment paging fetched `offset + limit` rows from both indexes and merged them in memory, which grows with the offset the caller asks for.
+**Search (PR #30 by @mjc).** Visibility was applied after ranking and paging rather than before, and combined entity-plus-attachment paging fetched `offset + limit` rows from both indexes and merged them in memory, which grows with the offset the caller asks for.
 
 - **Results that should not have been visible are gone.** Search could return hits from projects outside the caller's visible set, and an attachment linked to both a visible and a hidden project rendered the hidden project's identifier and title. Visibility is now part of the query, applied before ranking, sorting, and pagination.
 - Page size defaults to 20 and is capped at 500. Offsets clamp at 100,000. A full-text query is capped at 4 KiB and a literal substring query at 256 bytes, with an explicit 400 rather than a slow failure past that.
 - A literal search stops at 10,000 matches instead of scanning to the end of the table.
 - Combined paging fetches only the shortfall it actually needs.
 
-**Exports (PR #36 by [@mjc](https://github.com/mjc)).** An export built the whole tree in memory before sending any of it, and an HTTP client that stopped reading held its export slot open, so a couple of stalled downloads could stop anyone else exporting. On the receiving side, extraction trusted the archive's declared entry count and expanded size, which is the classic zip bomb.
+**Exports (PR #36 by @mjc).** An export built the whole tree in memory before sending any of it, and an HTTP client that stopped reading held its export slot open, so a couple of stalled downloads could stop anyone else exporting. On the receiving side, extraction trusted the archive's declared entry count and expanded size, which is the classic zip bomb.
 
 - **Everything an export materializes is now counted.** It previously asked for at most 10,000 issues and then loaded every comment on each of them with no limit at all, so the real ceiling was however much memory the machine had. The bounds are now 10,000 files, 1,000 comments per issue, 100,000 comments per project, 50,000 metadata items, 8 MiB per file, and 128 MiB in total, and an export past them fails with an explicit error instead of trying.
 - Two exports run at a time. The HTTP download streams in 64 KiB chunks and is dropped after 30 seconds idle or 30 minutes in total, so a stalled client is reaped rather than parked on a slot.
@@ -472,7 +472,7 @@ The comment bounds above are one instance of a pattern this release works throug
 
 Who is acting is now resolved one way everywhere: connected AI agents get identities of their own and act as themselves, login-free mode genuinely works, and `lific init` asks how you want to sign in instead of leaving that decision to a hand-edited config file. Alongside the identity work: two security fixes worth upgrading for on their own, comments you can edit and link to, and identifiers you can copy from wherever you see them.
 
-### Sign-in, identity, and agents (PR #23 by [@zorro432](https://github.com/zorro432))
+### Sign-in, identity, and agents (PR #23 by @zorro432)
 
 - **Login-free mode now works end to end.** Running with `required = false` used to be half-broken: project reads passed while admin endpoints answered 403, because the "no auth here" signal never reached the handler-level gates. Identity is now resolved in one place for REST, MCP, and CLI alike, every request carries a real user, and a login-free instance can administer itself.
 - **`lific init` asks how you want to sign in.** On a fresh install it offers Login-free or Passwords, states plainly what login-free means (anyone who can reach the server can administer it), binds login-free instances to loopback so that promise actually holds, and persists the choice to the config file. `--auth-mode` and `--password` cover scripted setups.
@@ -483,9 +483,9 @@ Who is acting is now resolved one way everywhere: connected AI agents get identi
 
 ### Security
 
-- **An uploaded SVG can no longer run script on your instance.** SVG is on the upload allowlist, and every image type was served with `Content-Disposition: inline`. Because an SVG is an XML document that may contain `<script>`, opening one directly (the "open image in new tab" path, not the rendered `<img>` in a comment) executed its script on Lific's own origin, where it could read the session token the web UI holds and act as whoever opened the file. Any account permitted to upload could use this to escalate against an admin who viewed the attachment. SVG uploads still work and still render in comments and pages; they now download rather than render when opened as a page of their own, and every attachment response carries `Content-Security-Policy: default-src 'none'; sandbox` as a second layer. Reported by [@mjc](https://github.com/mjc).
+- **An uploaded SVG can no longer run script on your instance.** SVG is on the upload allowlist, and every image type was served with `Content-Disposition: inline`. Because an SVG is an XML document that may contain `<script>`, opening one directly (the "open image in new tab" path, not the rendered `<img>` in a comment) executed its script on Lific's own origin, where it could read the session token the web UI holds and act as whoever opened the file. Any account permitted to upload could use this to escalate against an admin who viewed the attachment. SVG uploads still work and still render in comments and pages; they now download rather than render when opened as a page of their own, and every attachment response carries `Content-Security-Policy: default-src 'none'; sandbox` as a second layer. Reported by @mjc.
 
-- **A malformed config file now stops the server instead of silently reverting to defaults.** A config that failed to parse, including one broken by a single typo, produced a warning on stderr and then booted from the built-in defaults. Those defaults bind `0.0.0.0`, allow self-service signup, and treat an empty `cors_origins` as "any origin", so an operator who had set `host = "127.0.0.1"` and `allow_signup = false` could be left running a materially more exposed instance with nothing but a log line to say so. A config file that exists but cannot be read or parsed is now a hard startup failure naming the file and the error. Unknown keys are rejected for the same reason: `allow_signupp = false` used to be ignored silently and now fails loudly. A missing config file is still perfectly fine and still starts on defaults. Reported by [@mjc](https://github.com/mjc).
+- **A malformed config file now stops the server instead of silently reverting to defaults.** A config that failed to parse, including one broken by a single typo, produced a warning on stderr and then booted from the built-in defaults. Those defaults bind `0.0.0.0`, allow self-service signup, and treat an empty `cors_origins` as "any origin", so an operator who had set `host = "127.0.0.1"` and `allow_signup = false` could be left running a materially more exposed instance with nothing but a log line to say so. A config file that exists but cannot be read or parsed is now a hard startup failure naming the file and the error. Unknown keys are rejected for the same reason: `allow_signupp = false` used to be ignored silently and now fails loudly. A missing config file is still perfectly fine and still starts on defaults. Reported by @mjc.
 
 ### API
 
@@ -493,10 +493,10 @@ Who is acting is now resolved one way everywhere: connected AI agents get identi
 
 ### Web UI
 
-- **Comments have their own links, and `#N` becomes one.** A comment can be linked directly and the browser scrolls to it, and a bare `#12` in issue text resolves to that issue. (PR #24 by [@unger1984](https://github.com/unger1984))
-- **Edit and delete your own comments.** Editing is inline with the full composer (markdown, mentions, quoting, attachments), deleting asks for confirmation in place, and an edited comment carries an `edited` label with the exact time in its tooltip. (PR #25 by [@unger1984](https://github.com/unger1984))
-- **Home shows a live activity rate.** It seeds from the last 24 hours of activity you are allowed to see, then ticks along over the websocket instead of starting from a misleading zero. (PR #26 by [@mjc](https://github.com/mjc))
-- **Copy an identifier from wherever you are looking at it**: the detail-page breadcrumbs, a board card, or a list row. (PR #22 by [@lardissone](https://github.com/lardissone)) The copy and peek buttons are reachable by keyboard, not hover alone, and pills name the identifier they copy so a screen reader announces something useful.
+- **Comments have their own links, and `#N` becomes one.** A comment can be linked directly and the browser scrolls to it, and a bare `#12` in issue text resolves to that issue. (PR #24 by @unger1984)
+- **Edit and delete your own comments.** Editing is inline with the full composer (markdown, mentions, quoting, attachments), deleting asks for confirmation in place, and an edited comment carries an `edited` label with the exact time in its tooltip. (PR #25 by @unger1984)
+- **Home shows a live activity rate.** It seeds from the last 24 hours of activity you are allowed to see, then ticks along over the websocket instead of starting from a misleading zero. (PR #26 by @mjc)
+- **Copy an identifier from wherever you are looking at it**: the detail-page breadcrumbs, a board card, or a list row. (PR #22 by @lardissone) The copy and peek buttons are reachable by keyboard, not hover alone, and pills name the identifier they copy so a screen reader announces something useful.
 - **Copy selected text from the selection toolbar**, instead of reaching for the mouse to select and copy by hand.
 - **The desktop sidebar collapses**, giving the board and the issue list the full width.
 - **The status chip in the issue topbar is a picker.** Changing status no longer means opening the field below it.
@@ -524,7 +524,7 @@ Who is acting is now resolved one way everywhere: connected AI agents get identi
 
 Every identifier Lific prints is now something you can click. Windows gets a prebuilt binary and the same CI treatment Linux has always had. On a phone the web UI navigates like an application instead of a desktop layout squeezed sideways.
 
-### Links to everything (PR #19 by [@mjc](https://github.com/mjc))
+### Links to everything (PR #19 by @mjc)
 
 Issue ids, projects, pages, modules, plans, comments, search hits, activity entries, and relations render as Markdown links in MCP tool output, CLI output, and REST responses. An agent that reads `[PRO-42](https://tracker.example/PRO/issues/PRO-42)` can hand you something to click instead of an identifier you then have to go find.
 
@@ -540,7 +540,7 @@ Issue ids, projects, pages, modules, plans, comments, search hits, activity entr
 ### Windows
 
 - **There is a Windows binary.** `lific-windows-x86_64.exe` ships on the releases page, checksummed in `sha256sums.txt` alongside the Linux and macOS builds.
-- **CI runs the full suite on Windows**, the same clippy-with-warnings-as-errors and `cargo test --all-targets` that Linux gets. Nothing in CI or the release matrix had ever touched the platform, which is how v2.4.0 shipped unable to compile there at all: `service.rs` called the unix-only `libc::getuid()` with no platform guard. Reported in [#20](https://github.com/VoidNullable/lific/issues/20) by [@cuqz](https://github.com/cuqz).
+- **CI runs the full suite on Windows**, the same clippy-with-warnings-as-errors and `cargo test --all-targets` that Linux gets. Nothing in CI or the release matrix had ever touched the platform, which is how v2.4.0 shipped unable to compile there at all: `service.rs` called the unix-only `libc::getuid()` with no platform guard. Reported in [#20](https://github.com/Gopisokk/BacklogBridge-MCP/issues/20) by @cuqz.
 - **`lific service` no longer fails with "HOME is not set"** in environments that do not export `HOME`, which includes some cron and service contexts on Linux. It resolves your home directory the way the rest of the CLI already did.
 
 ### Web UI
@@ -557,7 +557,7 @@ Issue ids, projects, pages, modules, plans, comments, search hits, activity entr
 
 Projects can be filed into named groups in the sidebar, and the grouping belongs to you rather than to the instance. Alongside it, the last hover-only controls become reachable on touch, and the test suite stops depending on whatever is exported in your shell.
 
-### Project groups in the sidebar (PR #17 by [@lardissone](https://github.com/lardissone))
+### Project groups in the sidebar (PR #17 by @lardissone)
 
 A long project list had exactly one organizing tool: drag to reorder. Projects can now be collected into named, collapsible groups that render above the ungrouped list.
 
@@ -587,7 +587,7 @@ A long project list had exactly one organizing tool: drag to reorder. Projects c
 
 The CLI learns to talk to a running server over HTTP instead of requiring the database file, OAuth discovery works out of the box on localhost instances, and the documentation got a full contributed overhaul with a CI check that keeps it honest.
 
-### CLI: run data commands against a remote instance (PR #15 by [@mjc](https://github.com/mjc))
+### CLI: run data commands against a remote instance (PR #15 by @mjc)
 
 Every data command previously opened the SQLite file directly, so the CLI only worked on the machine hosting the instance. A new selectable HTTP backend routes those commands - issues, projects, pages, search, export, comments, modules, labels, and folders - through the REST API of a running server instead:
 
@@ -602,7 +602,7 @@ Supporting it, a new `GET /api/pages/resolve/{identifier}` endpoint resolves pag
 
 With `server.public_url` unset, OAuth discovery metadata advertised an issuer derived from the bind address - a client connecting via `localhost` or the IPv6 loopback then failed token audience validation, which broke MCP OAuth flows (Claude among them) against local instances. The issuer and every advertised OAuth endpoint now derive from the request's Host header when that host is allowlisted; an explicit `public_url` remains authoritative, and forwarded headers are never trusted for this.
 
-### Documentation, contributed and CI-enforced (PRs #6-#12 by [@mjc](https://github.com/mjc))
+### Documentation, contributed and CI-enforced (PRs #6-#12 by @mjc)
 
 - **Contracts are written down**: the REST API surface and the MCP tools' output shapes are now documented, and a sweep corrected reference drift between docs and code.
 - **Guides**: the web UI, upgrading, and repository layout each have one; connecting Codex is clarified; and the repo gains `SECURITY.md` and `CONTRIBUTING.md`.
@@ -630,11 +630,11 @@ Tool and parameter descriptions were rewritten to stop repeating what tool outpu
 
 ## v2.2.0 (2026-07-14)
 
-The web UI goes realtime, MCP tool output slims down to respect agent context budgets, and a security fix stops clients from spoofing their IP to the rate limiter. This is also the first release with external contributions: realtime invalidation arrived as PR #4 ([@mjc](https://github.com/mjc)) and comments pagination as PR #5 ([@Joshuabaker2](https://github.com/Joshuabaker2)).
+The web UI goes realtime, MCP tool output slims down to respect agent context budgets, and a security fix stops clients from spoofing their IP to the rate limiter. This is also the first release with external contributions: realtime invalidation arrived as PR #4 (@mjc) and comments pagination as PR #5 (@Joshuabaker2).
 
 ### Realtime web invalidation
 
-Two browser tabs - or you and your agent - no longer drift apart. Every state-changing write routed through the running HTTP/MCP server pushes an invalidation event over a WebSocket and open views resync live: issues, pages, plans, comments, attachments, saved views, module/folder structure, plans' cross-project issue effects, and the authz toggle. (PR #4 by [@mjc](https://github.com/mjc), hardened and extended in review.)
+Two browser tabs - or you and your agent - no longer drift apart. Every state-changing write routed through the running HTTP/MCP server pushes an invalidation event over a WebSocket and open views resync live: issues, pages, plans, comments, attachments, saved views, module/folder structure, plans' cross-project issue effects, and the authz toggle. (PR #4 by @mjc, hardened and extended in review.)
 
 CLI data commands and stdio MCP access SQLite directly. They do not publish into another running Lific process's in-memory realtime hub, so refresh the browser or wait for its normal revalidation after direct database changes.
 
@@ -654,7 +654,7 @@ Agents pay for every token a tool returns, and the chattiest tools were spending
 
 - **`get_board` omits done/cancelled issues by default** (LIF-300): status grouping shows closed columns as count-only stubs, priority/module grouping drops them with a trailing count. `include_closed=true` restores the old render; `max_per_column` caps each column with a `… +N more` tail.
 - **`get_issue` defaults to the last 3 comments** (LIF-301) with a truncation header; `include_comments='all'` for the whole thread, `'none'` for a stub. `list_comments` gains a `limit`.
-- **`list_comments` paginates** (LIF-326, PR #5 by [@Joshuabaker2](https://github.com/Joshuabaker2)): MCP and REST accept `limit`/`offset`. MCP output includes a continuation hint when more comments remain; REST returns the requested comment array without paging metadata. Unqualified calls still return the full thread in ascending order, exactly as before.
+- **`list_comments` paginates** (LIF-326, PR #5 by @Joshuabaker2): MCP and REST accept `limit`/`offset`. MCP output includes a continuation hint when more comments remain; REST returns the requested comment array without paging metadata. Unqualified calls still return the full thread in ascending order, exactly as before.
 - **`update_plan_step` returns a compact receipt** (LIF-302) - side-effect notes plus a one-line progress summary instead of re-rendering the whole tree. `echo_tree=true` restores the old output.
 - **`get_issue` relation lines carry the related issue's status** (LIF-303): `Blocked by: LIF-42 (done)` answers the follow-up before it's asked.
 

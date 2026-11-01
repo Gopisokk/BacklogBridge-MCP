@@ -1,6 +1,6 @@
 # Public projects
 
-The maintained guide is at [lific.dev/docs/public-projects](https://lific.dev/docs/public-projects).
+The maintained guide is at [lific.dev/docs/public-projects](https://github.com/Gopisokk/BacklogBridge-MCP).
 
 It covers publication, exposed and excluded data, the public HTTP API, request limits and hosting precautions.
 For the documentation shipped with this checkout or release tag, read the

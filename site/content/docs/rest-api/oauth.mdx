@@ -127,3 +127,4 @@ A token is bound to the connected-tool account created or reused at approval. A 
 ### POST `/oauth/revoke`
 
 Revokes an access token. Form body: `token`, and an optional `token_type_hint` that is ignored. The request itself must carry `Authorization: Bearer` with a session token or an OAuth access token; an API key is not accepted here, and without a valid credential the answer is `401`. Answers `200` whether or not the token existed, so it cannot be used to test tokens.
+

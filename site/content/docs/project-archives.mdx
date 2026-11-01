@@ -143,3 +143,4 @@ Export reads the project in one database transaction while holding the attachmen
 - **Errors.** Exceeding a limit answers `413`. A malformed or unsafe archive answers `400`. Another archive operation already running answers `429`.
 - **Report.** A successful import returns the identifier, row counts per table, the file count, the first 100 unresolved references and `external_reference_count` for the total. The full list is stored with the project and included in its next archive.
 - **Lost connections.** The server finishes an import even if the client disconnects, so a lost response means the result is unknown. Do not retry automatically. Check the project list, and open and verify the project before trusting it; a project with that identifier might have existed before your request.
+

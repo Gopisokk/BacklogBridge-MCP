@@ -1,10 +1,10 @@
 # Homebrew tap
 
-Lific ships to Homebrew through a tap, `VoidNullable/homebrew-tap`. Users install
+Lific ships to Homebrew through a tap, `Gopisokk/homebrew-tap`. Users install
 with:
 
 ```bash
-brew install voidnullable/tap/lific
+brew install Gopisokk/tap/lific
 ```
 
 The formula installs the prebuilt release binaries (macOS arm64 and x86_64,
@@ -26,7 +26,7 @@ Requested in GitHub issue #93.
   release job on every tag. It downloads the published `sha256sums.txt`,
   renders `Formula/lific.rb`, commits it to a checkout of the tap, installs and
   tests it with Homebrew on the Linux runner, and only then pushes.
-- **`VoidNullable/homebrew-tap`** holds `Formula/lific.rb`, and nothing else
+- **`Gopisokk/homebrew-tap`** holds `Formula/lific.rb`, and nothing else
   needs to be in it.
 
 The job is non-fatal (`continue-on-error: true`). The binaries are already
@@ -36,19 +36,19 @@ with a notice.
 
 ## One-time setup
 
-1. Create a **public** repository named `VoidNullable/homebrew-tap`, initialized
+1. Create a **public** repository named `Gopisokk/homebrew-tap`, initialized
    with a README so it has a `main` branch. The `homebrew-` prefix is what lets
-   users type `voidnullable/tap`.
+   users type `Gopisokk/tap`.
 2. Make a deploy key pair. Keep no copy of the private key once step 4 is done.
 
    ```bash
    ssh-keygen -t ed25519 -N "" -C "lific release workflow" -f homebrew-tap-deploy
    ```
 
-3. In `VoidNullable/homebrew-tap` → Settings → Deploy keys → Add deploy key:
+3. In `Gopisokk/homebrew-tap` → Settings → Deploy keys → Add deploy key:
    title `lific release workflow`, paste `homebrew-tap-deploy.pub`, and tick
    **Allow write access**.
-4. In `VoidNullable/lific` → Settings → Secrets and variables → Actions → New
+4. In `Gopisokk/BacklogBridge-MCP` → Settings → Secrets and variables → Actions → New
    repository secret: name `HOMEBREW_TAP_DEPLOY_KEY`, value the whole contents
    of `homebrew-tap-deploy` (the private key, including the `BEGIN` and `END`
    lines). Then delete both key files.
@@ -57,8 +57,8 @@ with a notice.
 
    ```bash
    version=2.11.1   # the latest release
-   gh release download "v$version" --repo VoidNullable/lific --pattern sha256sums.txt
-   git clone git@github.com:VoidNullable/homebrew-tap.git
+   gh release download "v$version" --repo Gopisokk/BacklogBridge-MCP --pattern sha256sums.txt
+   git clone git@github.com:Gopisokk/homebrew-tap.git
    mkdir -p homebrew-tap/Formula
    bash scripts/render-homebrew-formula.sh "$version" sha256sums.txt > homebrew-tap/Formula/lific.rb
    git -C homebrew-tap add Formula/lific.rb
@@ -66,7 +66,7 @@ with a notice.
    git -C homebrew-tap push
    ```
 
-6. Check it: `brew install voidnullable/tap/lific && lific --version`.
+6. Check it: `brew install Gopisokk/tap/lific && lific --version`.
 
 A deploy key is used instead of a personal access token because it can write to
 the tap repository and nothing else, and it does not expire.
@@ -94,3 +94,4 @@ formula would compile the crates.io package (which carries the built web UI)
 with Rust rather than install release binaries, and Homebrew's maintainers would
 take over version bumps. Its acceptance rules for notability and self-submitted
 projects apply, so it is a separate decision from the tap.
+

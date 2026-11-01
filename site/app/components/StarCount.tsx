@@ -9,7 +9,7 @@ let inflight: Promise<number | null> | null = null;
 
 function fetchStars(): Promise<number | null> {
   if (cachedStars !== null) return Promise.resolve(cachedStars);
-  inflight ??= fetch("https://api.github.com/repos/VoidNullable/lific", {
+  inflight ??= fetch("https://api.github.com/repos/Gopisokk/BacklogBridge-MCP", {
     headers: { Accept: "application/vnd.github+json" },
   })
     .then((r) => (r.ok ? r.json() : null))
@@ -71,3 +71,4 @@ export function StarCount() {
     </span>
   );
 }
+

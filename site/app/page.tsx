@@ -7,10 +7,10 @@ import { ForHumans } from "./components/sections/ForHumans";
 import { ForTeams } from "./components/sections/ForTeams";
 import { ForEveryone } from "./components/sections/ForEveryone";
 
-const GITHUB = "https://github.com/VoidNullable/lific";
+const GITHUB = "https://github.com/Gopisokk/BacklogBridge-MCP";
 const CRATE = "https://crates.io/crates/lific";
-const DISCORD = "https://discord.gg/uWvaFC4f7D";
-const RELEASES = "https://github.com/VoidNullable/lific/releases";
+const DISCORD = "https://github.com/Gopisokk/BacklogBridge-MCP";
+const RELEASES = "https://github.com/Gopisokk/BacklogBridge-MCP/releases";
 
 export const metadata: Metadata = {
   alternates: { canonical: "/" },
@@ -173,3 +173,4 @@ export default function Home() {
     </div>
   );
 }
+

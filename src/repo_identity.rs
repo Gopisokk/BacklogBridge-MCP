@@ -415,15 +415,15 @@ mod tests {
 
     #[test]
     fn ssh_scp_and_https_forms_of_the_same_repo_normalize_identically() {
-        let expected = "v1:github.com/VoidNullable/lific";
+        let expected = "v1:github.com/Gopisokk/BacklogBridge-MCP";
         for url in [
-            "ssh://git@github.com/VoidNullable/lific.git",
-            "git@github.com:VoidNullable/lific.git",
-            "git@github.com:VoidNullable/lific",
-            "https://github.com/VoidNullable/lific",
-            "https://github.com/VoidNullable/lific.git",
-            "git://github.com/VoidNullable/lific.git",
-            "https://github.com/VoidNullable/lific/",
+            "ssh://git@github.com/Gopisokk/BacklogBridge-MCP.git",
+            "git@github.com:Gopisokk/BacklogBridge-MCP.git",
+            "git@github.com:Gopisokk/BacklogBridge-MCP",
+            "https://github.com/Gopisokk/BacklogBridge-MCP",
+            "https://github.com/Gopisokk/BacklogBridge-MCP.git",
+            "git://github.com/Gopisokk/BacklogBridge-MCP.git",
+            "https://github.com/Gopisokk/BacklogBridge-MCP/",
         ] {
             assert_eq!(
                 normalize_remote_url(url).as_deref(),
@@ -468,12 +468,12 @@ mod tests {
     #[test]
     fn host_is_lowercased_but_path_case_is_preserved() {
         assert_eq!(
-            normalize_remote_url("git@GitHub.com:VoidNullable/lific.git").as_deref(),
-            Some("v1:github.com/VoidNullable/lific")
+            normalize_remote_url("git@GitHub.com:Gopisokk/BacklogBridge-MCP.git").as_deref(),
+            Some("v1:github.com/Gopisokk/BacklogBridge-MCP")
         );
         assert_eq!(
-            normalize_remote_url("https://GITHUB.COM/VoidNullable/Lific").as_deref(),
-            Some("v1:github.com/VoidNullable/Lific")
+            normalize_remote_url("https://github.com/Gopisokk/BacklogBridge-MCP").as_deref(),
+            Some("v1:github.com/Gopisokk/BacklogBridge-MCP")
         );
     }
 
@@ -538,7 +538,7 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "git@github.com:VoidNullable/lific.git",
+                "git@github.com:Gopisokk/BacklogBridge-MCP.git",
             ],
         );
 
@@ -546,7 +546,7 @@ mod tests {
         assert_eq!(kinds(&aliases), vec![AliasKind::Remote, AliasKind::Root]);
         assert_eq!(
             value_of(&aliases, &AliasKind::Remote).as_deref(),
-            Some("v1:github.com/VoidNullable/lific")
+            Some("v1:github.com/Gopisokk/BacklogBridge-MCP")
         );
 
         let root = git_ok(&repo, &["rev-list", "--max-parents=0", "HEAD"]);
@@ -682,3 +682,4 @@ mod tests {
         }
     }
 }
+

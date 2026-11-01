@@ -2,10 +2,10 @@
 import type { Metadata } from "next";
 import { SiteHeader } from "../components/SiteHeader";
 
-const GITHUB = "https://github.com/VoidNullable/lific";
+const GITHUB = "https://github.com/Gopisokk/BacklogBridge-MCP";
 const CRATE = "https://crates.io/crates/lific";
-const DISCORD = "https://discord.gg/uWvaFC4f7D";
-const ISSUES = "https://github.com/VoidNullable/lific/issues";
+const DISCORD = "https://github.com/Gopisokk/BacklogBridge-MCP";
+const ISSUES = "https://github.com/Gopisokk/BacklogBridge-MCP/issues";
 
 // The snapshot date. Bump this whenever a cell is re-verified or
 // corrected; the page is a dated snapshot, not an evergreen claim.
@@ -1138,3 +1138,4 @@ export default function Compare() {
     </div>
   );
 }
+

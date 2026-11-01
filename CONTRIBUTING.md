@@ -9,7 +9,7 @@ If you want to discuss an idea before writing code, open an issue. If you have a
 - **Source**: [github.com/Gopisokk/BacklogBridge-MCP](https://github.com/Gopisokk/BacklogBridge-MCP)
 - **License**: Apache-2.0
 - **Stack**: Rust 2024 edition (MSRV 1.88), Svelte 5 frontend (Tailwind v4, Vite, Bun)
-- **Docs**: [lific.dev/docs](https://lific.dev/docs)
+- **Docs**: [github.com/Gopisokk/BacklogBridge-MCP](https://github.com/Gopisokk/BacklogBridge-MCP)
 
 ## Building
 

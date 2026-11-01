@@ -117,3 +117,4 @@ When the two aliases point at different bindings, `lific bind` refuses to move t
 | `POST /api/repos/merge` | Move the aliases of binding `from` into binding `into`. Needs lead or administrator on both projects. |
 
 `from` and `into` are numeric binding IDs, not project IDs. Merging moves aliases between bindings; it does not merge the projects. The `into` binding survives and the `from` binding is removed. Afterwards, run `lific bind` to confirm the result and restart the agent.
+

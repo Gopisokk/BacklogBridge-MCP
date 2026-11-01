@@ -4,8 +4,8 @@ import { SiDiscord } from "@icons-pack/react-simple-icons";
 import { source } from "@/lib/source";
 import type { ReactNode } from "react";
 
-const GITHUB = "https://github.com/VoidNullable/lific";
-const DISCORD = "https://discord.gg/uWvaFC4f7D";
+const GITHUB = "https://github.com/Gopisokk/BacklogBridge-MCP";
+const DISCORD = "https://github.com/Gopisokk/BacklogBridge-MCP";
 
 export default function Layout({ children }: { children: ReactNode }) {
   return (
@@ -57,3 +57,4 @@ export default function Layout({ children }: { children: ReactNode }) {
     </RootProvider>
   );
 }
+

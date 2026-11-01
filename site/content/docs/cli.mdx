@@ -567,3 +567,4 @@ lific doctor [--key <API_KEY>] [--repair]
 | `--repair` | Applies pending database migrations while checking. Needs a readable configuration or an explicit `--db`. |
 
 Without `--repair`, `doctor` does not change the database: it runs no migrations and writes no data, although SQLite may still touch its WAL and SHM files. If the configuration cannot be read, `doctor` reports that and skips the checks that depend on it rather than running them against defaults. Pass `--db <PATH>` to inspect a particular database anyway.
+

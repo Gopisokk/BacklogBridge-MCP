@@ -75,3 +75,4 @@ An attachment becomes an orphan when an upload is never used, when every referen
 The uploader, an administrator, or a `maintainer` on a project the attachment is linked into can delete it. Deleting is immediate, with no trash: the attachment and all its links go, and its file is removed from disk unless another attachment has the same contents. References to it in Markdown stay in the text and no longer load, so edit them out. Uploading and deleting attachments are not recorded in the [activity log](/docs/concepts/comments-and-activity#activity-log).
 
 Deleting the item an attachment is linked from is different. An issue, page or comment in the trash keeps its links, so restoring it brings its attachments back with it. When the retention sweep removes the item for good, its links go too, and an attachment left with none is collected at the next orphan sweep. Deleting a project removes its content at once, so its attachments are collected the same way.
+

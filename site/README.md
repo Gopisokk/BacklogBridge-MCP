@@ -22,3 +22,4 @@ re-render them when the screens they show change.
 
 `lific:promo:render` still renders the board loop to
 `public/board-loop.mp4`, which the page no longer uses.
+

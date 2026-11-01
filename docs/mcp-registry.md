@@ -12,7 +12,7 @@ Tracked by LIF-253.
 - **`server.json`** (repo root) — the server manifest the registry ingests.
   Schema version `2025-12-11`.
 - **README ownership marker** — a visible line in `README.md`:
-  `mcp-name: io.github.VoidNullable/lific`. This is how the registry proves we
+  `mcp-name: io.github.Gopisokk/BacklogBridge-MCP`. This is how the registry proves we
   own the `lific` crate (see "Ownership verification" below). **Do not delete
   it and do not move it into an HTML comment** — see the crates.io gotcha below.
 
@@ -33,17 +33,17 @@ Tracked by LIF-253.
 
 ## Namespace and casing — READ THIS
 
-The server name is **`io.github.VoidNullable/lific`** — matching the GitHub login
-`VoidNullable` **with its exact capitalization**.
+The server name is **`io.github.Gopisokk/BacklogBridge-MCP`** — matching the GitHub login
+`Gopisokk` **with its exact capitalization**.
 
 This is deliberate and it contradicts the naive "namespaces are lowercase"
 assumption. As of July 2026 the registry's GitHub-namespace permission checks
 are **case-sensitive** and the normalization fix is still open
 ([registry#689](https://github.com/modelcontextprotocol/registry/issues/689)).
 The GitHub OIDC/device token authorizes `io.github.<login>/*` with the login's
-literal case, so a lowercase `io.github.voidnullable/lific` would fail namespace
+literal case, so a lowercase `io.github.Gopisokk/BacklogBridge-MCP` would fail namespace
 authorization until #689 lands. A real-world instance of this bug and its fix:
-<https://github.com/GavinLucas/docker-mcp/pull/74>.
+<#>.
 
 Three strings MUST stay identical, byte-for-byte, including case:
 
@@ -52,7 +52,7 @@ Three strings MUST stay identical, byte-for-byte, including case:
 3. whatever namespace your `mcp-publisher login github` token grants
 
 If #689 is resolved to force-lowercase before we publish, switch all three to
-`io.github.voidnullable/lific` together. Until then, keep the capital `V` and `N`.
+`io.github.Gopisokk/BacklogBridge-MCP` together. Until then, keep the capital `V` and `N`.
 
 ## Ownership verification (cargo-specific gotcha)
 
@@ -93,7 +93,7 @@ The release workflow has a `publish-registry` job that:
    SHA256 together when bumping.
 3. Authenticates with **GitHub OIDC** — `./mcp-publisher login github-oidc` —
    which needs `permissions: id-token: write` (set on the job). No stored
-   secret or PAT: the OIDC token proves the `io.github.VoidNullable/*`
+   secret or PAT: the OIDC token proves the `io.github.Gopisokk/*`
    namespace. The namespace casing must match `server.json`'s `name` and the
    README marker exactly (the check is case-sensitive — see casing section).
 4. Waits (up to ~2 min) for the just-published crate version to appear on
@@ -135,7 +135,7 @@ Preconditions: the crate version you're announcing is already live on crates.io
 
 ```bash
 # from the repo root, where server.json lives
-mcp-publisher login github      # device-code OAuth; grants io.github.VoidNullable/*
+mcp-publisher login github      # device-code OAuth; grants io.github.Gopisokk/*
 mcp-publisher publish           # validates server.json + verifies crate ownership
 ```
 
@@ -149,7 +149,7 @@ mcp-publisher publish           # validates server.json + verifies crate ownersh
 Verify it landed:
 
 ```bash
-curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.VoidNullable/lific"
+curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.Gopisokk/BacklogBridge-MCP"
 ```
 
 ### Bumping the version on each release
@@ -201,3 +201,4 @@ let the next release re-publish.
 - Official registry requirements: <https://github.com/modelcontextprotocol/registry/blob/main/docs/reference/server-json/official-registry-requirements.md>
 - server.json schema (2025-12-11): <https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json>
 - Namespace case-sensitivity bug: <https://github.com/modelcontextprotocol/registry/issues/689>
+

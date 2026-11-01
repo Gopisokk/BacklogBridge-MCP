@@ -373,3 +373,4 @@ For a private local deployment, `[auth] required = false` is a separate setting 
 1. Stop the service and keep its logs and the failed database as they are. Do not keep restarting it against your only copy of the data.
 2. Restore the backup with a binary of the version you were running before: into a separate data directory, or in place with `lific restore <ARCHIVE> --force` once you are sure of the archive and the target. `--force` moves the current database aside rather than deleting it.
 3. Run `lific doctor`, compare the configuration and client credentials with what you recorded, and only then send traffic back.
+

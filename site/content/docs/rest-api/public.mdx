@@ -62,3 +62,4 @@ These routes carry no credential, so they are bounded to keep anonymous traffic 
 | Download | Ends after 15 seconds without progress, or 5 minutes in total | The connection is closed. |
 
 Behind a reverse proxy, set [`trusted_proxies`](/docs/configuration#server) so the per-address limit sees visitors rather than the proxy. A request from a trusted proxy whose client-identity headers fail to verify is `503`.
+

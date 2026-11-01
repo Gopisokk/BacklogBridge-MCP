@@ -9,3 +9,4 @@ export default defineConfig({
   // Git-derived last-modified dates, surfaced in the sitemap.
   plugins: [lastModified()],
 });
+

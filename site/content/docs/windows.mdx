@@ -9,7 +9,7 @@ Lific runs natively on Windows. The server, web UI, CLI, REST API, MCP server an
 
 ## Install
 
-Download `lific-windows-x86_64.exe` and `sha256sums.txt` from the [releases page](https://github.com/VoidNullable/lific/releases), then verify the download in PowerShell:
+Download `lific-windows-x86_64.exe` and `sha256sums.txt` from the [releases page](https://github.com/Gopisokk/BacklogBridge-MCP/releases), then verify the download in PowerShell:
 
 ```powershell
 $expected = (Select-String -Path sha256sums.txt -Pattern 'lific-windows-x86_64\.exe').Line.Split(' ')[0]
@@ -127,7 +127,7 @@ WSL forwards localhost, so `http://localhost:3456` answers from a Windows browse
 A native source build needs Rust 1.88 or later, the Visual Studio C++ build tools and [Bun](https://bun.sh). Build the web UI first, because `build.rs` refuses a release build when `web\dist\index.html` is missing:
 
 ```powershell
-git clone https://github.com/VoidNullable/lific
+git clone https://github.com/Gopisokk/BacklogBridge-MCP
 cd lific
 cd web; bun install; bun run build; cd ..
 cargo build --release
@@ -136,3 +136,4 @@ cargo build --release
 The binary is written to `target\release\lific.exe`.
 
 The published Windows artifact is built differently: it is cross-compiled on Linux for the same MSVC target through the repository's `release-windows-msvc` devenv profile, then downloaded onto a Windows runner that checks its checksum and exercises its startup, database, API and embedded frontend before the release is published. Native Windows Clippy and `cargo test --all-targets` run as their own CI job on every push.
+

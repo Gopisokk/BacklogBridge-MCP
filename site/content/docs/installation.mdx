@@ -17,16 +17,16 @@ A container image is not published anywhere, but the repository's Dockerfile bui
 ## Install with Homebrew
 
 ```bash
-brew install voidnullable/tap/lific
+brew install Gopisokk/tap/lific
 ```
 
-The formula lives in the [VoidNullable/homebrew-tap](https://github.com/VoidNullable/homebrew-tap) tap and installs the release binary for your Mac or Linux machine, checked against the release's published SHA-256. It also installs shell completions for bash, zsh and fish. `brew upgrade lific` moves you to a new release once it is published.
+The formula lives in the [Gopisokk/homebrew-tap](https://github.com/Gopisokk/homebrew-tap) tap and installs the release binary for your Mac or Linux machine, checked against the release's published SHA-256. It also installs shell completions for bash, zsh and fish. `brew upgrade lific` moves you to a new release once it is published.
 
 On Linux, the background service that `lific init` sets up runs the exact Homebrew version you had at the time, and `brew upgrade` removes that version. After upgrading, run `lific service install` (with the same `--config`, if you used one) so the service runs the new binary. macOS is not affected.
 
 ## Download a release binary
 
-Every release publishes five binaries and a `sha256sums.txt` on the [releases page](https://github.com/VoidNullable/lific/releases).
+Every release publishes five binaries and a `sha256sums.txt` on the [releases page](https://github.com/Gopisokk/BacklogBridge-MCP/releases).
 
 | Platform | File |
 | --- | --- |
@@ -41,8 +41,8 @@ On any other operating system or architecture, use Cargo.
 On Linux, download the binary and the checksum file, verify the download, then put it on your `PATH`:
 
 ```bash
-curl -LO https://github.com/VoidNullable/lific/releases/latest/download/lific-linux-x86_64
-curl -LO https://github.com/VoidNullable/lific/releases/latest/download/sha256sums.txt
+curl -LO https://github.com/Gopisokk/BacklogBridge-MCP/releases/latest/download/lific-linux-x86_64
+curl -LO https://github.com/Gopisokk/BacklogBridge-MCP/releases/latest/download/sha256sums.txt
 sha256sum --ignore-missing -c sha256sums.txt
 chmod +x lific-linux-x86_64
 sudo mv lific-linux-x86_64 /usr/local/bin/lific
@@ -85,7 +85,7 @@ Cargo puts the binary in `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` on Windows),
 The Git repository does not carry the built web UI, so installing straight from it needs [Bun](https://bun.sh) and the `build-web` feature, which builds the frontend inside Cargo's temporary build directory:
 
 ```bash
-cargo install --git https://github.com/VoidNullable/lific --branch master --locked --features build-web
+cargo install --git https://github.com/Gopisokk/BacklogBridge-MCP --branch master --locked --features build-web
 ```
 
 `bun install` fetches the frontend's dependencies during the build, so this needs network access. Without `build-web`, the build stops with an error instead of producing a binary that has no web UI.
@@ -103,7 +103,7 @@ If the shell cannot find `lific`, the directory you put it in is not on your `PA
 Source builds run through the repository's [devenv](https://devenv.sh/) environment, which pins the Rust toolchain, Bun and the cross-compilation tools. The web UI is compiled into the binary, so every build task builds the frontend into `web/dist` before Cargo runs.
 
 ```bash
-git clone https://github.com/VoidNullable/lific
+git clone https://github.com/Gopisokk/BacklogBridge-MCP
 cd lific
 devenv allow
 devenv shell
@@ -139,3 +139,4 @@ A release build stops with an error when `web/dist/index.html` is missing or emp
 ## Next
 
 You have a binary, not yet an instance. [Quickstart](/docs/quickstart) creates the database and your account, starts the server, and connects your AI tools.
+

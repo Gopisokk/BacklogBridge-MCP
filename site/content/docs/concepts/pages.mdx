@@ -85,3 +85,4 @@ To catch up on a page read earlier, an agent passes the `seq` from that read as 
 Deleting a page moves it to the trash, along with its comments. It disappears from lists, search and public projects at once. For the next 30 days, a maintainer (an administrator, for a workspace page) can restore it with `POST /api/pages/{id}/restore`, and the comments come back with it. After that the retention sweep removes it permanently. `trash_days` in the [`[retention]`](/docs/configuration#retention) section sets the window.
 
 The page's identifier is not handed out again while it is in the trash, so a restore never collides with a newer page.
+

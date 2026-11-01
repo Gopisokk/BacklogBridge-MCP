@@ -7,3 +7,4 @@ export function getMDXComponents(components?: MDXComponents): MDXComponents {
     ...components,
   };
 }
+

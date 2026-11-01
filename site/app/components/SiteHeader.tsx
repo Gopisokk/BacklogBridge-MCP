@@ -1,9 +1,9 @@
 import { StarCount } from "./StarCount";
 import { VersionChip } from "./VersionChip";
 
-const GITHUB = "https://github.com/VoidNullable/lific";
+const GITHUB = "https://github.com/Gopisokk/BacklogBridge-MCP";
 const CRATE = "https://crates.io/crates/lific";
-const DISCORD = "https://discord.gg/uWvaFC4f7D";
+const DISCORD = "https://github.com/Gopisokk/BacklogBridge-MCP";
 
 export function SiteHeader({ page }: { page: "home" | "compare" }) {
   const isCompare = page === "compare";
@@ -86,3 +86,4 @@ export function SiteHeader({ page }: { page: "home" | "compare" }) {
     </header>
   );
 }
+

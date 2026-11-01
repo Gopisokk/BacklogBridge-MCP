@@ -25,7 +25,7 @@ $(hash_for 5)  lific-windows-x86_64.exe
 EOF
 
 formula="$(bash "$render" v2.11.1 "$scratch/sums.txt")"
-base="https://github.com/VoidNullable/lific/releases/download/v2.11.1"
+base="https://github.com/Gopisokk/BacklogBridge-MCP/releases/download/v2.11.1"
 
 expect_pair() {
   local asset="$1" hash="$2"
@@ -52,3 +52,4 @@ if bash "$render" 2.11 "$scratch/sums.txt" >/dev/null 2>&1; then
 fi
 
 echo "render-homebrew-formula: ok"
+

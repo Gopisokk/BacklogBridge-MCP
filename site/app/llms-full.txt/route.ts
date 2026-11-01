@@ -29,3 +29,4 @@ export async function GET() {
     headers: { "Content-Type": "text/plain; charset=utf-8" },
   });
 }
+
