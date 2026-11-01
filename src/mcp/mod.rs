@@ -1,0 +1,1662 @@
+mod arguments;
+pub(crate) mod page_reads;
+pub(crate) mod preinit;
+pub(crate) mod schemas;
+pub(crate) mod tools;
+mod waits;
+
+#[cfg(test)]
+use std::cell::Cell;
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
+
+use rmcp::{
+    ServerHandler,
+    handler::server::router::tool::ToolRouter,
+    model::{ProtocolVersion, ServerCapabilities, ServerInfo},
+};
+
+use crate::db::DbPool;
+use crate::db::models::AuthUser;
+use crate::links::IssueLinkContext;
+use crate::realtime::{RealtimeEvent, RealtimeHub};
+use crate::storage::AttachmentStore;
+
+/// HTTP content negotiation used by stdio proxies to carry binary results.
+pub(crate) const INLINE_ATTACHMENT_HEADER: &str = "x-lific-mcp-inline-attachment";
+
+/// Direct-call tests still use process-wide context; production HTTP requests
+/// carry their context through rmcp's request extensions instead.
+#[cfg(test)]
+static MCP_HANDLER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Per-request user identity storage.
+/// Protected from races by MCP_HANDLER_LOCK ensuring serial access.
+/// Uses unwrap_or_else to recover from poison (e.g. if a handler panics).
+#[cfg(test)]
+static MCP_REQUEST_USER: Mutex<Option<AuthUser>> = Mutex::new(None);
+
+/// Per-request external origin used for structured resource links.
+/// Protected by [`MCP_HANDLER_LOCK`] for the same reason as the identity state.
+#[cfg(test)]
+static MCP_REQUEST_ISSUE_LINKS: Mutex<Option<Arc<IssueLinkContext>>> = Mutex::new(None);
+
+enum RequestData {
+    Scoped {
+        user: Option<AuthUser>,
+        issue_links: Option<Arc<IssueLinkContext>>,
+    },
+    Http(Arc<HttpRequestData>),
+}
+
+tokio::task_local! {
+    static REQUEST_DATA: RequestData;
+}
+
+/// Most tools use synchronous SQLite calls on Tokio workers. Bound concurrent
+/// tools to leave a worker available for HTTP and websocket tasks, while
+/// retaining the four-tool cap on larger runtimes. Twelve permits divide
+/// evenly by every allowed concurrency (1 to 4), so each tool takes
+/// `12 / allowed` permits and exactly `allowed` tools run at once.
+const MCP_TOOL_PERMIT_TOTAL: usize = 12;
+static MCP_TOOL_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MCP_TOOL_PERMIT_TOTAL);
+
+/// Permits one tool call takes on a runtime with `workers` worker threads.
+fn mcp_tool_permits_per_call(workers: usize) -> u32 {
+    let allowed_concurrency = workers.saturating_sub(1).clamp(1, 4);
+    (MCP_TOOL_PERMIT_TOTAL / allowed_concurrency) as u32
+}
+
+/// rmcp copies HTTP request parts into each tool call's extensions before it
+/// spawns the handler task. The Axum route supplies this value there.
+pub(crate) struct HttpRequestData {
+    pub user: Option<AuthUser>,
+    pub issue_links: IssueLinkContext,
+}
+
+// HTTP callers already own the request data through an Arc, while scoped
+// callers own the link context directly. Keep both handles here so reading
+// the context never needs to allocate another Arc.
+pub(crate) enum IssueLinkContextRef {
+    Scoped(Arc<IssueLinkContext>),
+    Http(Arc<HttpRequestData>),
+}
+
+impl IssueLinkContextRef {
+    fn as_context(&self) -> &IssueLinkContext {
+        match self {
+            Self::Scoped(context) => context,
+            Self::Http(context) => &context.issue_links,
+        }
+    }
+}
+
+impl std::ops::Deref for IssueLinkContextRef {
+    type Target = IssueLinkContext;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_context()
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_REQUEST_ISSUE_LINKS: Option<Arc<IssueLinkContext>>;
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ISSUE_LINK_CONTEXT_READS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Scope an MCP caller's context to the task that actually executes the tool.
+///
+/// LIF-155: also scope the audit actor context (transport = mcp) around
+/// stdio tool calls. HTTP tool calls scope it after rmcp's task spawn.
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn with_request_user<F, Fut, R>(user: Option<AuthUser>, f: F) -> R
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = R>,
+{
+    with_request_context(user, None, f).await
+}
+
+/// Scope a stdio or direct test request with its identity and optional link
+/// origin. HTTP routes carry this data in request extensions instead.
+pub async fn with_request_context<F, Fut, R>(
+    user: Option<AuthUser>,
+    issue_links: Option<IssueLinkContext>,
+    f: F,
+) -> R
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = R>,
+{
+    #[cfg(test)]
+    {
+        let _guard = MCP_HANDLER_LOCK.lock().await;
+        let test_issue_links = issue_links.clone().map(Arc::new);
+        *MCP_REQUEST_USER.lock().unwrap_or_else(|e| e.into_inner()) = user.clone();
+        *MCP_REQUEST_ISSUE_LINKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = test_issue_links.clone();
+        let _clear = RequestGlobalGuard;
+        TEST_REQUEST_ISSUE_LINKS
+            .scope(
+                test_issue_links,
+                scope_request_context(user, issue_links, f()),
+            )
+            .await
+    }
+    #[cfg(not(test))]
+    scope_request_context(user, issue_links, f()).await
+}
+
+async fn scope_request_context<Fut, R>(
+    user: Option<AuthUser>,
+    issue_links: Option<IssueLinkContext>,
+    future: Fut,
+) -> R
+where
+    Fut: std::future::Future<Output = R>,
+{
+    scope_request_data(
+        RequestData::Scoped {
+            user,
+            issue_links: issue_links.map(Arc::new),
+        },
+        future,
+    )
+    .await
+}
+
+async fn scope_request_data<Fut, R>(request_data: RequestData, future: Fut) -> R
+where
+    Fut: std::future::Future<Output = R>,
+{
+    let actor = crate::actor::ActorCtx {
+        user_id: match &request_data {
+            RequestData::Scoped { user, .. } => user.as_ref().map(|user| user.id),
+            RequestData::Http(context) => context.user.as_ref().map(|user| user.id),
+        },
+        transport: crate::actor::Transport::Mcp,
+    };
+    REQUEST_DATA
+        .scope(request_data, crate::actor::scope(actor, future))
+        .await
+}
+
+/// Drops the per-request globals on scope exit (panic-safe). Declared after the
+/// globals are set in [`with_request_context`], so it runs before the handler
+/// lock is released.
+#[cfg(test)]
+struct RequestGlobalGuard;
+#[cfg(test)]
+impl Drop for RequestGlobalGuard {
+    fn drop(&mut self) {
+        *MCP_REQUEST_USER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *MCP_REQUEST_ISSUE_LINKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+/// Get the authenticated user for the current MCP request, if any.
+pub(crate) fn current_auth_user() -> Option<AuthUser> {
+    if let Ok(user) = REQUEST_DATA.try_with(|context| match context {
+        RequestData::Scoped { user, .. } => user.clone(),
+        RequestData::Http(context) => context.user.clone(),
+    }) {
+        return user;
+    }
+    #[cfg(test)]
+    return MCP_REQUEST_USER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    #[cfg(not(test))]
+    None
+}
+
+/// The `LIFIC_TOKEN` a stdio MCP session was launched with, plus what it takes
+/// to check it.
+///
+/// `LIFIC_TOKEN` is an API key by documented contract, so this is the same
+/// credential the HTTP transport would validate per request. A stdio session
+/// has no per-request credential to validate, which is exactly the problem:
+/// the process can outlive the key by days. Keeping the raw token here lets
+/// [`LificMcp::with_stdio_auth`] re-check it on every tool call, so revoking
+/// the key takes effect at the next call instead of the next restart.
+///
+/// The token is never logged, never rendered, and never leaves this struct;
+/// there is deliberately no `Debug`, `Display` or accessor for it.
+pub(crate) struct StdioAuth {
+    token: String,
+}
+
+impl StdioAuth {
+    pub(crate) fn new(token: String) -> Self {
+        Self { token }
+    }
+
+    /// Resolve the token against the database as it stands *now*.
+    ///
+    /// `Ok(Some(user))` is a valid key bound to a live identity;
+    /// `Ok(None)` is a valid but unbound key, which keeps the operator
+    /// fallback; `Err` is a key that no longer authenticates at all (revoked,
+    /// expired, belonging to a deactivated account or to a bot whose owner was
+    /// deactivated), or a database failure, which fails closed.
+    fn resolve(&self, db: &DbPool) -> Result<Option<AuthUser>, String> {
+        crate::auth::resolve_api_key_user(db, &self.token)
+    }
+}
+
+/// The stdio credential did not revalidate, so the tool was not run.
+///
+/// Deliberately carries nothing. Why the token failed (revoked, expired, owner
+/// deactivated, database unavailable) is operator information and goes to the
+/// log; the agent gets one message and one instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StdioAuthFailed;
+
+impl StdioAuthFailed {
+    /// What the agent is told. No database state, no distinction between
+    /// causes, just the action that fixes every one of them.
+    const MESSAGE: &'static str = "This Lific session's credential (LIFIC_TOKEN) is no longer \
+         valid, so the tool was not run. Run `lific connect` to reconnect this tool, then \
+         restart the MCP server.";
+
+    fn into_tool_result(self) -> rmcp::model::CallToolResult {
+        rmcp::model::CallToolResult::error(vec![rmcp::model::Content::text(Self::MESSAGE)])
+    }
+}
+
+/// LIFIC-11: the resolved identity for the current MCP request. MCP now
+/// resolves the caller exactly as REST does — via [`crate::resolve_caller::resolve_caller`] —
+/// so a credential-less request (unbound API key, legacy OAuth token, or a
+/// stdio session with no bound user) falls back to the first admin, and the
+/// gates read `identity.user.is_admin`. The separate operator flag is gone:
+/// every credential that authenticates is trusted as the operator, matching
+/// REST one-for-one (no transport-specific divergence).
+pub(crate) fn current_identity(
+    db: &crate::db::DbPool,
+) -> Option<crate::resolve_caller::ResolvedIdentity> {
+    crate::resolve_caller::resolve_caller(db, current_auth_user(), crate::actor::Transport::Mcp)
+        .ok()
+        .flatten()
+}
+
+/// Get the validated external origin for structured resource links, if this MCP
+/// request arrived through an HTTP transport that knows it.
+pub(crate) fn current_issue_link_context() -> Option<IssueLinkContextRef> {
+    if let Ok(links) = REQUEST_DATA.try_with(|context| match context {
+        RequestData::Scoped { issue_links, .. } => {
+            issue_links.clone().map(IssueLinkContextRef::Scoped)
+        }
+        RequestData::Http(context) => Some(IssueLinkContextRef::Http(context.clone())),
+    }) {
+        #[cfg(test)]
+        TEST_ISSUE_LINK_CONTEXT_READS.set(TEST_ISSUE_LINK_CONTEXT_READS.get() + 1);
+        return links;
+    }
+    #[cfg(test)]
+    {
+        TEST_ISSUE_LINK_CONTEXT_READS.set(TEST_ISSUE_LINK_CONTEXT_READS.get() + 1);
+        TEST_REQUEST_ISSUE_LINKS
+            .try_with(Clone::clone)
+            .unwrap_or(None)
+            .map(IssueLinkContextRef::Scoped)
+    }
+    #[cfg(not(test))]
+    None
+}
+
+#[cfg(test)]
+pub(crate) fn reset_issue_link_context_reads() {
+    TEST_ISSUE_LINK_CONTEXT_READS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn issue_link_context_reads() -> usize {
+    TEST_ISSUE_LINK_CONTEXT_READS.get()
+}
+
+/// Per-session instructions handed to every connected MCP agent via
+/// `get_info`. This is unconditional context cost on every session, so the
+/// convention guidance appended after the discovery guidance is kept tight
+/// (imperative, no filler). Extracted as a const so it stays testable.
+const SERVER_INSTRUCTIONS: &str = "Lific is an issue tracker. On resume, call get_briefing(project='X', since='<last cursor>') first; omit since the first time. \
+     list_resources(resource_type='project') lists projects. list_issues filters issues; workable=true gives open issues with no open blocker. \
+     search finds text in issues and pages. \
+     When you finish an issue, set status='done'. Keep each issue one self-contained change, filed in one of the project's modules. \
+     For small text changes use edit_issue and edit_page, not full updates. \
+     Use plans (create_plan) for multi-step or multi-session work; a step can mirror an issue. get_plan(plan='X-PLAN-1') gives a plan's full tree. \
+     Use pages for documentation and design notes.";
+
+/// LIF-452: the one sentence a repository-bound stdio session appends to
+/// [`SERVER_INSTRUCTIONS`]. Kept to a single clause for the same reason the
+/// base string is: every connected agent pays for it at session start.
+///
+/// `pub(crate)` because the remote stdio proxy ([`crate::cli::mcp_proxy`])
+/// appends the very same sentence to the instructions it relays, and the two
+/// must not drift.
+pub(crate) fn bound_project_note(project: &str) -> String {
+    format!(
+        " This session is bound to project {project}; project-scoped tools default to it when \
+         project is omitted."
+    )
+}
+
+#[derive(Clone)]
+pub struct LificMcp {
+    db: Arc<DbPool>,
+    realtime: RealtimeHub,
+    /// LIF-418: where `upload_attachment` writes bytes and `get_attachment`
+    /// reads them. Derived from the pool's database path, which is the same
+    /// resolution `server.rs` uses for REST's store, so both transports hit
+    /// one content-addressed directory.
+    store: AttachmentStore,
+    tool_router: &'static ToolRouter<Self>,
+    transport: McpTransport,
+    /// Present only for a stdio session launched with a `LIFIC_TOKEN`. `None`
+    /// covers both the HTTP transport (whose request parts carry identity)
+    /// and a tokenless local stdio session,
+    /// which keeps its credential-less operator behavior.
+    stdio_auth: Option<Arc<StdioAuth>>,
+    /// LIF-451: the project identifier (e.g. `"LIF"`) this session's working
+    /// directory is bound to, resolved once at stdio startup. Tools that would
+    /// otherwise reject an omitted `project` fall back to it; see
+    /// [`LificMcp::project_or_bound`] for the per-tool policy. Always `None`
+    /// on the HTTP transport, which has no single working directory to bind.
+    bound_project: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum McpTransport {
+    Http,
+    Stdio,
+}
+
+impl LificMcp {
+    /// A tokenless MCP session for direct and in-memory transport tests.
+    /// Production HTTP routes use [`Self::with_realtime`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn new(db: DbPool) -> Self {
+        Self::for_stdio(db, None)
+    }
+
+    pub fn with_realtime(db: DbPool, realtime: RealtimeHub) -> Self {
+        let store = AttachmentStore::from_db_path(db.path());
+        Self {
+            db: Arc::new(db),
+            realtime,
+            store,
+            tool_router: Self::shared_tool_router(),
+            transport: McpTransport::Http,
+            stdio_auth: None,
+            bound_project: None,
+        }
+    }
+
+    /// LIF-451: point this server at the project the session's repository is
+    /// bound to. Only `lific mcp` (stdio) calls this; every other constructor
+    /// leaves it `None`, which is the pre-binding behavior exactly.
+    pub fn with_bound_project(mut self, project: Option<String>) -> Self {
+        self.bound_project = project;
+        self
+    }
+
+    /// The `lific mcp` (stdio) constructor.
+    ///
+    /// `auth` is `Some` when the session was launched with a `LIFIC_TOKEN`,
+    /// which is then revalidated before every tool call. `None` is the
+    /// tokenless local session: no credential to check, operator behavior, the
+    /// same as before.
+    pub fn for_stdio(db: DbPool, auth: Option<StdioAuth>) -> Self {
+        Self {
+            transport: McpTransport::Stdio,
+            stdio_auth: auth.map(Arc::new),
+            ..Self::with_realtime(db, RealtimeHub::new())
+        }
+    }
+
+    /// The stdio revalidation seam. Every tool call goes through here.
+    ///
+    /// With no stdio credential this is a pass-through. HTTP requests are
+    /// scoped in [`Self::call_tool`] from their request extensions.
+    ///
+    /// With one, the token is re-resolved against the database *on this call*
+    /// and the tool runs inside [`with_request_user`] with whatever came back,
+    /// so both the authorization gates and the audit actor read the identity as
+    /// it is now rather than as it was at launch. A token that no longer
+    /// authenticates returns [`StdioAuthFailed`] and `f` is never awaited, so a
+    /// revoked agent cannot mutate anything on its next call.
+    ///
+    /// The failure is a typed local error rather than a wire type, so the seam
+    /// stays reusable and the decision about how a client should see it lives
+    /// in one place ([`Self::dispatch_tool`]).
+    async fn with_stdio_auth<F, Fut, R>(&self, f: F) -> Result<R, StdioAuthFailed>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = R>,
+    {
+        let Some(auth) = self.stdio_auth.clone() else {
+            return Ok(f().await);
+        };
+        let user = auth.resolve(&self.db).map_err(|reason| {
+            // The reason names DB state (revoked, expired, deactivated owner,
+            // backend fault). It is useful in the operator's log and is not
+            // something the agent needs, or should be told.
+            tracing::warn!(reason, "stdio LIFIC_TOKEN no longer authenticates");
+            StdioAuthFailed
+        })?;
+        Ok(with_request_user(user, f).await)
+    }
+
+    /// The central tool-call seam: revalidate, then dispatch.
+    ///
+    /// A stdio credential that no longer authenticates comes back as a failed
+    /// **tool result** (`is_error: true`) rather than a JSON-RPC protocol
+    /// error. The request itself was perfectly well formed, so `-32600
+    /// Invalid Request` is a lie about what went wrong, and MCP clients treat
+    /// protocol errors as a broken server: several drop the session or stop
+    /// surfacing anything to the model. A tool error reaches the agent as text
+    /// it can read and act on, which is the whole point of telling it to
+    /// reconnect. Either way `f` never runs.
+    async fn dispatch_tool<F, Fut>(
+        &self,
+        f: F,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<rmcp::model::CallToolResult, rmcp::ErrorData>>,
+    {
+        match self.with_stdio_auth(f).await {
+            Ok(result) => result,
+            Err(StdioAuthFailed) => Ok(StdioAuthFailed.into_tool_result()),
+        }
+    }
+
+    /// Point the attachment tools at an explicit store. An in-memory pool has
+    /// no real database file to derive a directory from, so tests that upload
+    /// bytes hand in a scratch directory instead of writing into the process's
+    /// working directory.
+    #[cfg(test)]
+    pub(crate) fn with_attachment_store(mut self, store: AttachmentStore) -> Self {
+        self.store = store;
+        self
+    }
+
+    fn emit(&self, event: RealtimeEvent) {
+        self.realtime.send(event);
+    }
+
+    /// Emit an event stamped with the seq of the row the tool just wrote
+    /// (LIF-440), so a reconnecting web client can replay it rather than
+    /// discovering the change only on its next full refetch.
+    fn emit_with_seq(&self, event: RealtimeEvent, seq: i64) {
+        self.realtime.send_with_seq(event, seq);
+    }
+
+    /// LIF-387: one borrowed read connection for a tool's whole pre-flight
+    /// (resolve the project, then its module or folder), instead of a fresh
+    /// checkout per resolver. Reads never block each other, so holding it
+    /// across the authz gates that follow costs nothing.
+    pub(crate) fn read_conn(&self) -> Result<crate::db::ReadConn, String> {
+        self.db.read().map_err(sanitize_error)
+    }
+
+    fn read<F, T>(&self, f: F) -> Result<T, String>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<T, crate::error::LificError>,
+    {
+        let conn = self.db.read().map_err(sanitize_error)?;
+        f(&conn).map_err(sanitize_error)
+    }
+
+    /// LIF-155: stamp the actor from the tool task's request context. The HTTP
+    /// request task-local does not survive rmcp's internal spawn, so
+    /// [`Self::call_tool`] scopes it again from the HTTP request extensions.
+    fn stamp_request_actor(conn: &rusqlite::Connection) {
+        let user = current_auth_user();
+        crate::actor::stamp(
+            conn,
+            &crate::actor::ActorCtx {
+                user_id: user.map(|user| user.id),
+                transport: crate::actor::Transport::Mcp,
+            },
+        );
+    }
+
+    fn write<F, T>(&self, f: F) -> Result<T, String>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<T, crate::error::LificError>,
+    {
+        let conn = self.db.write().map_err(sanitize_error)?;
+        Self::stamp_request_actor(&conn);
+        f(&conn).map_err(sanitize_error)
+    }
+
+    fn transaction<F, T>(&self, f: F) -> Result<T, String>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<T, crate::error::LificError>,
+    {
+        self.db
+            .transaction(|conn| {
+                Self::stamp_request_actor(conn);
+                f(conn)
+            })
+            .map_err(sanitize_error)
+    }
+}
+
+/// LIF-411: the MCP twin of REST's [`LificError::into_response`] sanitization
+/// (`error.rs`). `Database` and `Internal` carry raw SQLite/driver text —
+/// table and column names, constraint bodies, file paths — which REST has
+/// never returned to a client and MCP was handing straight to the agent (and
+/// therefore to whoever reads its transcript). Log the detail server-side,
+/// return the same generic message REST does. Every other variant is a
+/// caller-facing message and passes through unchanged.
+pub(crate) fn sanitize_error(error: crate::error::LificError) -> String {
+    use crate::error::LificError;
+    match &error {
+        LificError::Database(inner) => {
+            tracing::error!(error = %inner, "database error");
+            "internal server error".to_string()
+        }
+        LificError::Internal(message) => {
+            tracing::error!(error = %message, "internal error");
+            "internal server error".to_string()
+        }
+        // LIF-441: REST hands the whole conflicting entity back under
+        // `current`; an agent gets a one-line digest instead. Enough to see
+        // what changed and decide, without spending its context on a body it
+        // can re-read with one tool call if it needs the rest.
+        LificError::UpdateConflict { message, current } => {
+            let summary = LificError::conflict_summary(current);
+            if summary.is_empty() {
+                message.clone()
+            } else {
+                format!("{message}. Current state: {summary}")
+            }
+        }
+        other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+impl LificMcp {
+    /// LIF-201: expose the live `ToolRouter`'s tool names for the
+    /// enumeration-derived MCP completeness check (`authz_coverage_tests`).
+    /// Reads the same `list_all()` the production `list_tools` MCP handler
+    /// serves, so a tool that's registered but forgotten in the
+    /// classification manifest can't hide.
+    pub(crate) fn list_tool_names(&self) -> Vec<String> {
+        self.tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect()
+    }
+
+    /// The live tool surface as `(name, input schema)` pairs, read from the
+    /// same `list_all()` the production `list_tools` handler serves — so a
+    /// check written against this is checking what clients actually receive,
+    /// not a parallel description of it.
+    pub(crate) fn list_tool_schemas(&self) -> Vec<(String, serde_json::Value)> {
+        self.tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| {
+                let schema = serde_json::to_value(&t.input_schema)
+                    .expect("a tool's input schema must serialize");
+                (t.name.to_string(), schema)
+            })
+            .collect()
+    }
+}
+
+impl ServerHandler for LificMcp {
+    fn get_info(&self) -> ServerInfo {
+        // Pin to 2025-03-26: rmcp defaults to 2025-06-18 which many clients
+        // (including Zed) skipped, going straight from 2025-03-26 to 2025-11-25.
+        let info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2025_03_26)
+            // Identify as lific, not rmcp's build-env default — this name is
+            // what connected clients (and `lific doctor`) display.
+            .with_server_info(rmcp::model::Implementation::new(
+                "lific",
+                env!("CARGO_PKG_VERSION"),
+            ));
+        // LIF-452: a bound session says so, once, in one sentence. The
+        // unbound path stays byte-identical to before the feature existed.
+        match &self.bound_project {
+            Some(project) => info.with_instructions(format!(
+                "{SERVER_INSTRUCTIONS}{}",
+                bound_project_note(project)
+            )),
+            None => info.with_instructions(SERVER_INSTRUCTIONS),
+        }
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::ListToolsResult, rmcp::ErrorData>>
+    + rmcp::service::MaybeSendFuture
+    + '_ {
+        std::future::ready(Ok(rmcp::model::ListToolsResult {
+            tools: self.tool_router.list_all(),
+            ..Default::default()
+        }))
+    }
+
+    /// The one place every MCP tool call passes through, whatever the
+    /// transport. The stdio credential check lives here rather than in each
+    /// tool for exactly that reason, and so does the rewrite of an
+    /// unknown-parameter error into a did-you-mean (LIF-474).
+    ///
+    /// Not an `async fn`: the `rmcp` trait declares an explicit
+    /// `MaybeSendFuture` bound on the return type, which the desugared form
+    /// has to restate.
+    #[allow(clippy::manual_async_fn)]
+    fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        mut context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::CallToolResult, rmcp::ErrorData>>
+    + rmcp::service::MaybeSendFuture
+    + '_ {
+        async move {
+            let workers = tokio::runtime::Handle::current().metrics().num_workers();
+            let _permit = MCP_TOOL_PERMITS
+                .acquire_many(mcp_tool_permits_per_call(workers))
+                .await
+                .expect("MCP tool semaphore is never closed");
+            let http_context = context
+                .extensions
+                .get_mut::<axum::http::request::Parts>()
+                .and_then(|parts| parts.extensions.remove::<Arc<HttpRequestData>>());
+            let http_user = context
+                .extensions
+                .get_mut::<axum::http::request::Parts>()
+                .and_then(|parts| parts.extensions.remove::<Option<AuthUser>>());
+            if self.transport == McpTransport::Http && http_context.is_none() && http_user.is_none()
+            {
+                tracing::error!("HTTP MCP tool call has no request context");
+                return Err(rmcp::ErrorData::internal_error(
+                    "HTTP MCP request context missing",
+                    None,
+                ));
+            }
+            let tool = request.name.clone();
+            let provided: Vec<String> = request
+                .arguments
+                .as_ref()
+                .map(|arguments| arguments.keys().cloned().collect())
+                .unwrap_or_default();
+            let tool_context =
+                rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+            let dispatch = || self.dispatch_tool(|| self.tool_router.call(tool_context));
+            let result = match http_context {
+                Some(http) => scope_request_data(RequestData::Http(http), dispatch()).await,
+                None if self.transport == McpTransport::Http => {
+                    scope_request_context(http_user.flatten(), None, dispatch()).await
+                }
+                None => dispatch().await,
+            };
+            result.map_err(|error| {
+                let params = self
+                    .tool_router
+                    .get(&tool)
+                    .map(|tool| arguments::ToolParameters::from_schema(&tool.input_schema));
+                arguments::explain_unknown_parameter(&tool, params, &provided, error)
+            })
+        }
+    }
+
+    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        self.tool_router.get(name).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        Extension, Router,
+        body::Body,
+        http::{Request, StatusCode},
+        middleware,
+        routing::get,
+    };
+    use http_body_util::BodyExt;
+    use rusqlite::params;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn request_contexts_can_overlap_without_leaking_identity() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let run = |id, name: &'static str, barrier: Arc<tokio::sync::Barrier>| async move {
+            let user = AuthUser {
+                id,
+                username: name.into(),
+                display_name: name.into(),
+                is_admin: false,
+            };
+            scope_request_context(
+                Some(user),
+                IssueLinkContext::parse(&format!("https://{name}.example")),
+                async move {
+                    barrier.wait().await;
+                    tokio::task::yield_now().await;
+                    (
+                        current_auth_user().unwrap().id,
+                        current_issue_link_context()
+                            .unwrap()
+                            .issue_markdown("LIF-1")
+                            .to_string(),
+                    )
+                },
+            )
+            .await
+        };
+        let alice = tokio::spawn(run(11, "alice", barrier.clone()));
+        let bob = tokio::spawn(run(22, "bob", barrier.clone()));
+        tokio::time::timeout(std::time::Duration::from_secs(2), barrier.wait())
+            .await
+            .expect("both MCP requests must enter concurrently");
+        let (alice, bob) = tokio::join!(alice, bob);
+        let (alice_id, alice_link) = alice.unwrap();
+        let (bob_id, bob_link) = bob.unwrap();
+        assert_eq!((alice_id, bob_id), (11, 22));
+        assert!(alice_link.contains("alice.example"), "{alice_link}");
+        assert!(bob_link.contains("bob.example"), "{bob_link}");
+        assert!(current_auth_user().is_none());
+    }
+
+    // ── LIF-204: OAuth-token user_id -> resolved AuthUser (MCP path) ─────
+    //
+    // The /mcp route (see main.rs) sits behind the same `require_api_key`
+    // REST middleware, then pulls `Extension<Option<AuthUser>>` out of the
+    // request and threads it into `with_request_user` so MCP tools can read
+    // it back via `current_auth_user()`. This test reproduces that exact
+    // wiring (minus the rmcp transport itself) to prove an OAuth-token-backed
+    // MCP session resolves to the correct, real user rather than None.
+
+    /// LIF-411: `Database` and `Internal` carry driver/schema detail REST has
+    /// always withheld from clients; every other variant is a message written
+    /// for the caller and must survive intact.
+    #[test]
+    fn sanitize_error_hides_only_database_and_internal_detail() {
+        use crate::error::LificError;
+
+        assert_eq!(
+            sanitize_error(LificError::Database(rusqlite::Error::InvalidColumnName(
+                "secret_column".into()
+            ))),
+            "internal server error"
+        );
+        assert_eq!(
+            sanitize_error(LificError::Internal("/srv/lific/lific.db is locked".into())),
+            "internal server error"
+        );
+
+        for (error, expected) in [
+            (
+                LificError::NotFound("issue LIF-1 not found".into()),
+                "Not found: issue LIF-1 not found",
+            ),
+            (
+                LificError::BadRequest("invalid status 'nope'".into()),
+                "Bad request: invalid status 'nope'",
+            ),
+            (
+                LificError::Forbidden(
+                    "requires at least 'maintainer' access to this project".into(),
+                ),
+                "Forbidden: requires at least 'maintainer' access to this project",
+            ),
+            (
+                LificError::Conflict("identifier already exists".into()),
+                "Conflict: identifier already exists",
+            ),
+        ] {
+            assert_eq!(sanitize_error(error), expected);
+        }
+    }
+
+    fn insert_oauth_token(pool: &DbPool, suffix: &str, user_id: Option<i64>) -> String {
+        let token = format!("lific_at_test-{suffix}");
+        let hash = crate::auth::sha256_hex(token.as_bytes());
+        let expires = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let client_id = format!("client-{suffix}");
+        let conn = pool.write().unwrap();
+        conn.execute(
+            "INSERT INTO oauth_clients (client_id, client_name, redirect_uris) VALUES (?1, 'Test', '[\"http://localhost\"]')",
+            params![client_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO oauth_tokens (access_token, client_id, expires_at, scope, user_id) VALUES (?1, ?2, ?3, 'mcp', ?4)",
+            params![hash, client_id, expires, user_id],
+        )
+        .unwrap();
+        token
+    }
+
+    /// Mirrors the production `/mcp` route in main.rs: `require_api_key`
+    /// resolves the bearer token to `Extension<Option<AuthUser>>`, then the
+    /// handler extracts it and runs `with_request_user` around the rest of
+    /// the request. Here the "rest of the request" is just reading back
+    /// `current_auth_user()`, which is what every MCP tool does.
+    fn mcp_echo_app(auth_state: crate::auth::AuthState) -> Router {
+        async fn echo(Extension(auth_user): Extension<Option<AuthUser>>) -> String {
+            crate::mcp::with_request_user(auth_user, || async {
+                match crate::mcp::current_auth_user() {
+                    Some(u) => format!("user:{}:{}:{}", u.id, u.username, u.is_admin),
+                    None => "none".to_string(),
+                }
+            })
+            .await
+        }
+        Router::new()
+            .route("/mcp-echo", get(echo))
+            .layer(middleware::from_fn_with_state(
+                auth_state,
+                crate::auth::require_api_key,
+            ))
+    }
+
+    #[tokio::test]
+    async fn oauth_token_backed_mcp_session_resolves_current_auth_user() {
+        let pool = crate::db::open_memory().expect("test db");
+        let user_id = {
+            let conn = pool.write().unwrap();
+            crate::db::queries::users::create_user(
+                &conn,
+                &crate::db::models::CreateUser {
+                    username: "mcp-token-user".into(),
+                    email: "mcp-token-user@test.com".into(),
+                    password: "testpassword1".into(),
+                    display_name: Some("MCP Token User".into()),
+                    is_admin: false,
+                    is_bot: false,
+                },
+            )
+            .unwrap()
+            .id
+        };
+        let token = insert_oauth_token(&pool, "mcp", Some(user_id));
+
+        let auth_state = crate::auth::AuthState {
+            db: pool.clone(),
+            public_url: "https://example.com".into(),
+            required: true,
+        };
+
+        let resp = mcp_echo_app(auth_state)
+            .oneshot(
+                Request::builder()
+                    .uri("/mcp-echo")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            bytes.as_ref(),
+            format!("user:{user_id}:mcp-token-user:false").as_bytes(),
+            "OAuth-token-backed MCP session must resolve current_auth_user() to the bound user"
+        );
+
+        // The global must be cleared after the request completes so it
+        // never leaks into an unrelated subsequent request.
+        assert!(current_auth_user().is_none());
+    }
+
+    #[tokio::test]
+    async fn with_request_context_scopes_issue_link_origin() {
+        let context = IssueLinkContext::parse("https://tracker.example/base");
+        let (seen, global_seen) = with_request_context(None, context, || async {
+            let scoped = current_issue_link_context()
+                .expect("request origin should be visible")
+                .issue_markdown("LIF-1")
+                .to_string();
+            let global = MCP_REQUEST_ISSUE_LINKS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .expect("production request context should also be populated")
+                .issue_markdown("LIF-1")
+                .to_string();
+            (scoped, global)
+        })
+        .await;
+
+        assert_eq!(
+            seen,
+            "[LIF-1](https://tracker.example/base/LIF/issues/LIF-1)"
+        );
+        assert_eq!(global_seen, seen);
+        assert!(current_issue_link_context().is_none());
+        assert!(
+            MCP_REQUEST_ISSUE_LINKS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none()
+        );
+    }
+
+    // End-to-end: a credential-less MCP request resolves to the first admin
+    // (via resolve_caller), so it passes an enforced-mode Viewer gate. LIFIC-11
+    // unified MCP onto the same resolve_caller path REST uses, so the old
+    // operator-vs-legacy-OAuth distinction is gone: an unbound API key and a
+    // legacy unbound OAuth token both authenticate and both resolve to the
+    // first admin. Mirrors the /mcp route wiring (require_api_key → with_request_user
+    // → current_identity), then runs a real authz gate.
+    #[tokio::test]
+    async fn unbound_credentials_resolve_to_first_admin_and_pass_mcp_gate() {
+        use axum::extract::State;
+        use axum::response::IntoResponse;
+
+        let pool = crate::db::open_memory().expect("test db");
+        // resolve_caller needs a first_admin to resolve credential-less requests to
+        {
+            let conn = pool.write().unwrap();
+            crate::db::queries::users::create_user(
+                &conn,
+                &crate::db::models::CreateUser {
+                    username: "admin".into(),
+                    email: "admin@test.local".into(),
+                    password: "adminpass123".into(),
+                    display_name: None,
+                    is_admin: true,
+                    is_bot: false,
+                },
+            )
+            .unwrap();
+        }
+        let unbound_key = crate::auth::create_api_key(&pool, "mcp-operator", None).unwrap();
+        let project = {
+            let conn = pool.write().unwrap();
+            crate::db::queries::settings::update(
+                &conn,
+                crate::db::queries::settings::InstanceSettingsPatch {
+                    authz_enforced: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            crate::db::queries::create_project(
+                &conn,
+                &crate::db::models::CreateProject {
+                    name: "MCP Gate".into(),
+                    identifier: "MGT".into(),
+                    description: String::new(),
+                    emoji: None,
+                    lead_user_id: None,
+                },
+            )
+            .unwrap()
+            .id
+        };
+        let oauth_token = insert_oauth_token(&pool, "mcp-legacy-unbound", None);
+
+        // Route that mirrors main.rs's /mcp identity plumbing, then runs the
+        // same authz gate an MCP Viewer-tool would (authz::require_role over
+        // the resolved identity).
+        async fn gate(
+            State((pool, project_id)): State<(DbPool, i64)>,
+            axum::Extension(auth_user): axum::Extension<Option<AuthUser>>,
+        ) -> axum::response::Response {
+            crate::mcp::with_request_user(auth_user, || async {
+                let db = std::sync::Arc::new(pool);
+                match crate::authz::require_role(
+                    &db,
+                    &crate::mcp::current_identity(&db),
+                    project_id,
+                    crate::db::models::Role::Viewer,
+                ) {
+                    Ok(()) => (StatusCode::OK, "allowed").into_response(),
+                    Err(e) => e.into_response(),
+                }
+            })
+            .await
+        }
+
+        let auth_state = crate::auth::AuthState {
+            db: pool.clone(),
+            public_url: "https://example.com".into(),
+            required: true,
+        };
+        let app = Router::new()
+            .route("/mcp-gate", get(gate))
+            .with_state((pool.clone(), project))
+            .layer(middleware::from_fn_with_state(
+                auth_state,
+                crate::auth::require_api_key,
+            ));
+
+        let status = |key: String, app: Router| async move {
+            app.oneshot(
+                Request::builder()
+                    .uri("/mcp-gate")
+                    .header("authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        };
+
+        assert_eq!(
+            status(unbound_key, app.clone()).await,
+            StatusCode::OK,
+            "an unbound API key authenticates and resolves to the first admin, passing the enforced MCP Viewer gate"
+        );
+        assert_eq!(
+            status(oauth_token, app).await,
+            StatusCode::OK,
+            "a legacy unbound OAuth token also authenticates and resolves to the first admin — MCP and REST now share one resolve_caller path"
+        );
+    }
+
+    // ── LIF-256: session instructions carry Lific's workflow conventions ──
+    //
+    // Every connected agent receives these at session start, so the string
+    // must keep the discovery guidance AND surface the key conventions
+    // (mark done, prefer edit_* for small changes, use plans/pages/modules).
+    #[test]
+    fn get_info_instructions_include_conventions() {
+        let pool = crate::db::open_memory().expect("test db");
+        let mcp = LificMcp::new(pool);
+        let info = mcp.get_info();
+        let instructions = info
+            .instructions
+            .expect("server info must carry instructions");
+
+        // Discovery guidance is preserved.
+        assert!(instructions.contains("list_resources(resource_type='project')"));
+        assert!(instructions.contains("workable=true"));
+
+        // Convention guidance is present.
+        assert!(
+            instructions.contains("done"),
+            "instructions must tell agents to mark finished issues done"
+        );
+        assert!(
+            instructions.contains("edit_issue"),
+            "instructions must steer agents to edit_issue for small changes"
+        );
+        assert!(instructions.contains("edit_page"));
+        assert!(instructions.contains("modules"));
+        assert!(instructions.contains("create_plan"));
+        // LIF-483: resuming starts with one briefing instead of a plan listing.
+        assert!(instructions.contains("On resume, call get_briefing(project='X', since="));
+        assert!(instructions.contains("get_plan(plan='X-PLAN-1') gives a plan's full tree"));
+        assert!(instructions.contains("pages for documentation"));
+    }
+
+    // Clients display serverInfo.name — it must say lific, not rmcp's
+    // build-env default.
+    #[test]
+    fn get_info_identifies_as_lific() {
+        let pool = crate::db::open_memory().expect("test db");
+        let mcp = LificMcp::new(pool);
+        let info = mcp.get_info();
+        assert_eq!(info.server_info.name, "lific");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    // Every connected agent pays for these instructions at session start
+    // (LIF-505). Hold the whole string, not just the conventions, to a
+    // budget.
+    #[test]
+    fn server_instructions_stay_compact() {
+        let length = SERVER_INSTRUCTIONS.len();
+        assert!(
+            length <= 900,
+            "server instructions grew to {length} chars; keep them tight"
+        );
+
+        // LIF-452: the binding sentence is a second unconditional cost, paid
+        // by every bound session. One sentence, and it stays one sentence.
+        let bound = bound_project_note("LIF").len();
+        assert!(
+            bound <= 200,
+            "the bound-session note grew to {bound} chars; keep it to one sentence"
+        );
+    }
+
+    // ── LIF-452: a bound session is told so, once ──
+
+    #[test]
+    fn get_info_tells_a_bound_session_which_project_it_defaults_to() {
+        let pool = crate::db::open_memory().expect("test db");
+        let mcp = LificMcp::new(pool).with_bound_project(Some("LIF".into()));
+
+        let instructions = mcp
+            .get_info()
+            .instructions
+            .expect("server info must carry instructions");
+
+        assert!(
+            instructions.starts_with(SERVER_INSTRUCTIONS),
+            "the binding note is appended, never a rewrite: {instructions}"
+        );
+        assert!(instructions.contains("bound to project LIF"));
+        assert!(instructions.contains("project is omitted"));
+    }
+
+    #[test]
+    fn get_info_instructions_are_unchanged_for_an_unbound_session() {
+        let pool = crate::db::open_memory().expect("test db");
+        let mcp = LificMcp::new(pool);
+
+        let instructions = mcp
+            .get_info()
+            .instructions
+            .expect("server info must carry instructions");
+
+        assert_eq!(
+            instructions, SERVER_INSTRUCTIONS,
+            "an unbound session must pay nothing for the feature"
+        );
+    }
+
+    // ── LIFIC-18: stdio session identity (set_stdio_user seam) ─────────────
+    //
+    // The `lific mcp` entrypoint installs the session identity once at startup
+    // via `set_stdio_user` (see main.rs), and every tool call resolves through
+    // `current_identity`. This is seam two of the spec: with a valid bound
+    // token the agent resolves as itself; with none, the operator (first
+    // admin) fallback applies.
+
+    fn seed_user(
+        pool: &crate::db::DbPool,
+        username: &str,
+        admin: bool,
+    ) -> crate::db::models::AuthUser {
+        let conn = pool.write().expect("write conn");
+        let u = crate::db::queries::users::create_user(
+            &conn,
+            &crate::db::models::CreateUser {
+                username: username.into(),
+                email: format!("{username}@local.test"),
+                password: "somepass123".into(),
+                display_name: None,
+                is_admin: admin,
+                is_bot: false,
+            },
+        )
+        .expect("create user");
+        crate::db::models::AuthUser {
+            id: u.id,
+            username: u.username,
+            display_name: u.display_name,
+            is_admin: u.is_admin,
+        }
+    }
+
+    /// Seed a human owner plus a connected-tool bot they own, and mint the
+    /// bot an API key: the exact shape `lific connect` produces and hands to
+    /// an agent as `LIFIC_TOKEN`.
+    fn connected_agent(
+        pool: &crate::db::DbPool,
+    ) -> (crate::db::models::AuthUser, crate::db::models::User, String) {
+        // A separate instance admin exists as the operator fallback, so
+        // deactivating the owner is not "the last admin" and the agent's
+        // identity is provably not just that fallback.
+        seed_user(pool, "operator", true);
+        let owner = seed_user(pool, "owner", false);
+        let bot = {
+            let conn = pool.write().expect("write conn");
+            crate::db::queries::users::create_bot_user(
+                &conn,
+                owner.id,
+                "opencode-owner",
+                "OpenCode",
+                Some("opencode"),
+            )
+            .expect("create bot")
+        };
+        let token = crate::auth::create_api_key(pool, "opencode-owner", Some(bot.id))
+            .expect("mint agent key");
+        (owner, bot, token)
+    }
+
+    fn server_for(pool: &crate::db::DbPool, auth: Option<StdioAuth>) -> LificMcp {
+        LificMcp::for_stdio(pool.clone(), auth)
+    }
+
+    /// Run a body through the revalidation seam and report what identity it
+    /// saw. Standing in for a real tool body: `with_stdio_auth` is what every
+    /// tool runs inside, so whatever this observes, a tool observes.
+    async fn observed_identity(
+        server: &LificMcp,
+        pool: &crate::db::DbPool,
+    ) -> Result<Option<crate::resolve_caller::ResolvedIdentity>, StdioAuthFailed> {
+        server
+            .with_stdio_auth(|| async { current_identity(pool) })
+            .await
+    }
+
+    /// The shape `dispatch_tool` dispatches: a boxed future producing what the
+    /// real `ToolRouter::call` produces.
+    type ToolBody = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<rmcp::model::CallToolResult, rmcp::ErrorData>>
+                + Send,
+        >,
+    >;
+
+    /// A tool body that records whether it ran and writes if it does, plus the
+    /// flag to check afterwards. Anything that reaches this has been let
+    /// through the seam.
+    fn mutating_tool(
+        pool: &crate::db::DbPool,
+    ) -> (
+        impl FnOnce() -> ToolBody + use<>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        let pool = pool.clone();
+        let body = move || {
+            Box::pin(async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                let conn = pool.write().unwrap();
+                conn.execute(
+                    "INSERT INTO oauth_clients (client_id, client_name, redirect_uris)
+                     VALUES ('mutation-marker', 'Tool ran', '[]')",
+                    [],
+                )
+                .unwrap();
+                Ok(rmcp::model::CallToolResult::success(vec![
+                    rmcp::model::Content::text("ran"),
+                ]))
+            }) as ToolBody
+        };
+        (body, ran)
+    }
+
+    #[tokio::test]
+    async fn a_stdio_tool_call_resolves_as_the_agent_the_token_names() {
+        let _sguard = crate::mcp::tools::acquire_test_guard();
+        let pool = crate::db::open_memory().expect("test db");
+        let (owner, bot, token) = connected_agent(&pool);
+        let server = server_for(&pool, Some(StdioAuth::new(token)));
+
+        let identity = observed_identity(&server, &pool)
+            .await
+            .expect("a live token authenticates")
+            .expect("a bound stdio session resolves");
+        assert_eq!(
+            identity.user.id, bot.id,
+            "the audit actor is the bot, not the operator it inherits from"
+        );
+        assert_ne!(identity.user.id, owner.id);
+        assert_eq!(identity.transport, crate::actor::Transport::Mcp);
+    }
+
+    /// The whole point of the seam: a long-running session must not keep
+    /// working after its credential is revoked.
+    #[tokio::test]
+    async fn revoking_the_token_stops_the_very_next_tool_call() {
+        let _sguard = crate::mcp::tools::acquire_test_guard();
+        let pool = crate::db::open_memory().expect("test db");
+        let (_owner, _bot, token) = connected_agent(&pool);
+        let server = server_for(&pool, Some(StdioAuth::new(token)));
+
+        assert!(observed_identity(&server, &pool).await.is_ok());
+
+        crate::auth::revoke_api_key(&pool, "opencode-owner").expect("revoke");
+
+        // Through `dispatch_tool`, which is the exact seam `call_tool` uses,
+        // so this is the mapping a client actually receives.
+        let (body, ran) = mutating_tool(&pool);
+        let result = server
+            .dispatch_tool(body)
+            .await
+            .expect("a dead credential is a tool failure, not a protocol failure");
+
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "the agent must see this as a failed tool call"
+        );
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the tool body must not run at all, so nothing is mutated"
+        );
+        let mutations: i64 = pool
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM oauth_clients WHERE client_id = 'mutation-marker'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mutations, 0, "nothing was written");
+
+        // The message tells the agent what to do and leaks no database state.
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("lific connect"), "{text}");
+        assert!(text.contains("restart"), "{text}");
+        for internal in ["revoked", "deactivated", "database", "expired", "hash"] {
+            assert!(
+                !text.contains(internal),
+                "the agent must not be told why: {text}"
+            );
+        }
+    }
+
+    /// The success side of the same seam: a live credential dispatches, and
+    /// the tool's own result comes back untouched.
+    #[tokio::test]
+    async fn a_live_credential_dispatches_the_tool_through_the_central_seam() {
+        let _sguard = crate::mcp::tools::acquire_test_guard();
+        let pool = crate::db::open_memory().expect("test db");
+        let (_owner, _bot, token) = connected_agent(&pool);
+        let server = server_for(&pool, Some(StdioAuth::new(token)));
+
+        let (body, ran) = mutating_tool(&pool);
+        let result = server.dispatch_tool(body).await.expect("dispatches");
+
+        assert_eq!(result.is_error, Some(false));
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A password change or sign-out-everywhere revokes the owner's bots'
+    /// keys, so the same seam catches it.
+    #[tokio::test]
+    async fn an_account_lockdown_stops_the_agents_next_tool_call() {
+        let _sguard = crate::mcp::tools::acquire_test_guard();
+        let pool = crate::db::open_memory().expect("test db");
+        let (owner, _bot, token) = connected_agent(&pool);
+        let server = server_for(&pool, Some(StdioAuth::new(token)));
+
+        assert!(observed_identity(&server, &pool).await.is_ok());
+        {
+            let conn = pool.write().unwrap();
+            crate::db::queries::users::lock_down_account(&conn, owner.id).unwrap();
+        }
+        assert!(observed_identity(&server, &pool).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn deactivating_the_owner_stops_the_agents_next_tool_call() {
+        let _sguard = crate::mcp::tools::acquire_test_guard();
+        let pool = crate::db::open_memory().expect("test db");
+        let (owner, _bot, token) = connected_agent(&pool);
+        let server = server_for(&pool, Some(StdioAuth::new(token)));
+
+        assert!(observed_identity(&server, &pool).await.is_ok());
+        {
+            let conn = pool.write().unwrap();
+            crate::db::queries::users::set_active(&conn, owner.id, false).unwrap();
+        }
+        assert!(
+            observed_identity(&server, &pool).await.is_err(),
+            "a bot whose owner is deactivated is a dead credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unbound_key_still_resolves_to_the_operator() {
+        let _sguard = crate::mcp::tools::acquire_test_guard();
+        let pool = crate::db::open_memory().expect("test db");
+        let admin = seed_user(&pool, "operator", true);
+        let token = crate::auth::create_api_key(&pool, "default", None).unwrap();
+        let server = server_for(&pool, Some(StdioAuth::new(token)));
+
+        let identity = observed_identity(&server, &pool)
+            .await
+            .expect("an unbound key is valid")
+            .expect("operator fallback resolves");
+        assert_eq!(identity.user.id, admin.id);
+        assert!(identity.user.is_admin);
+    }
+
+    #[tokio::test]
+    async fn a_tokenless_stdio_session_keeps_operator_behavior() {
+        let _sguard = crate::mcp::tools::acquire_test_guard();
+        let pool = crate::db::open_memory().expect("test db");
+        let admin = seed_user(&pool, "operator", true);
+        let server = server_for(&pool, None);
+
+        let identity = observed_identity(&server, &pool)
+            .await
+            .expect("no credential to fail")
+            .expect("operator fallback resolves");
+        assert_eq!(
+            identity.user.id, admin.id,
+            "no-token stdio session must resolve to the first admin"
+        );
+        assert_eq!(identity.transport, crate::actor::Transport::Mcp);
+    }
+
+    #[test]
+    fn tool_permits_allow_one_fewer_call_than_workers_up_to_four() {
+        for (workers, allowed) in [(1, 1), (2, 1), (3, 2), (4, 3), (5, 4), (32, 4)] {
+            let per_call = mcp_tool_permits_per_call(workers) as usize;
+            assert_eq!(
+                MCP_TOOL_PERMIT_TOTAL / per_call,
+                allowed,
+                "{workers} workers should allow {allowed} concurrent tools"
+            );
+            assert_eq!(MCP_TOOL_PERMIT_TOTAL % per_call, 0);
+        }
+    }
+
+    /// A session without a stdio credential must not replace the identity
+    /// already scoped around the call; the seam passes straight through.
+    #[tokio::test]
+    async fn a_tokenless_stdio_seam_keeps_the_scoped_identity() {
+        let _sguard = crate::mcp::tools::acquire_test_guard();
+        let pool = crate::db::open_memory().expect("test db");
+        let server = LificMcp::new(pool.clone());
+        let user = seed_user(&pool, "http-caller", true);
+
+        let seen = with_request_context(Some(user.clone()), None, || async {
+            server
+                .with_stdio_auth(|| async { current_auth_user() })
+                .await
+                .expect("pass-through")
+        })
+        .await;
+        assert_eq!(
+            seen.map(|u| u.id),
+            Some(user.id),
+            "the scoped identity survives the seam untouched"
+        );
+    }
+}
+
+#[cfg(test)]
+mod surface_tests {
+    //! Guards on the *shape* of the published MCP tool surface.
+    //!
+    //! LIF-433 and LIF-435 reported that `edit_issue`/`edit_page` advertised
+    //! camelCase parameters (`oldString`) while the deserializer wanted
+    //! snake_case, making the cheap edit path unusable over MCP. Dumping the
+    //! real `tools/list` response showed the server has only ever published
+    //! snake_case, so the camelCase came from the reporting client, not from
+    //! here. Both issues were closed as client-side.
+    //!
+    //! The suggested fix was still the right idea, and it is what this module
+    //! is: a check driven by the advertised schema itself rather than a
+    //! hand-maintained list of tools, so schema-versus-deserializer drift
+    //! cannot reach a client the way it appeared to have.
+
+    use crate::mcp::LificMcp;
+
+    fn live_surface() -> Vec<(String, serde_json::Value)> {
+        let db = crate::db::open_memory().expect("test db");
+        LificMcp::new(db).list_tool_schemas()
+    }
+
+    /// Session instructions are examples clients may copy as MCP calls, so
+    /// every named argument in them must exist in the tool's published schema.
+    #[test]
+    fn server_instruction_examples_use_published_tool_arguments() {
+        let instructions = super::SERVER_INSTRUCTIONS;
+        let mut checked = 0;
+
+        for (tool, schema) in live_surface() {
+            let marker = format!("{tool}(");
+            let mut remaining = instructions;
+            while let Some((_, call)) = remaining.split_once(&marker) {
+                let (arguments, rest) = call
+                    .split_once(')')
+                    .unwrap_or_else(|| panic!("unterminated {tool} example in instructions"));
+                let properties = schema
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .unwrap_or_else(|| panic!("{tool} has no published input properties"));
+
+                for argument in arguments.split(',').map(str::trim) {
+                    let Some((name, _)) = argument.split_once('=') else {
+                        continue;
+                    };
+                    let name = name.trim();
+                    assert!(
+                        properties.contains_key(name),
+                        "{tool} instructions use `{name}`, absent from its published schema"
+                    );
+                    checked += 1;
+                }
+
+                remaining = rest;
+            }
+        }
+
+        assert!(checked >= 4, "checked only {checked} instruction arguments");
+    }
+
+    /// Every parameter a client is told to send must be snake_case, because
+    /// that is what serde deserializes. A camelCase property here would be
+    /// rejected at the JSON-RPC boundary with a bare "missing field" and no
+    /// hint that the schema itself was the liar.
+    #[test]
+    fn every_advertised_parameter_is_snake_case() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+
+        for (tool, schema) in live_surface() {
+            let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+                // A tool with no parameters at all is legitimate; a tool whose
+                // schema stopped being an object with `properties` is not, and
+                // the count assertion below is what notices.
+                continue;
+            };
+            for name in props.keys() {
+                checked += 1;
+                let snake = name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                if !snake {
+                    offenders.push(format!("{tool}.{name}"));
+                }
+            }
+        }
+
+        // Without this the test passes vacuously the day the schema changes
+        // shape and `properties` stops being where parameters live.
+        assert!(
+            checked > 50,
+            "only {checked} parameters inspected across the whole surface — the \
+             schema shape probably changed and this test is no longer looking \
+             at anything"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these advertised parameters are not snake_case, so a client that \
+             follows the schema will be rejected by the deserializer: {offenders:?}"
+        );
+    }
+
+    /// Anything listed as required must also be described in `properties`.
+    /// A required name with no property is unanswerable: the client is told to
+    /// send a field it has been given no definition for.
+    #[test]
+    fn every_required_parameter_is_also_declared() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+
+        for (tool, schema) in live_surface() {
+            assert!(
+                schema.is_object(),
+                "{tool}'s input schema is not a JSON object: {schema}"
+            );
+            let required = schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let props = schema.get("properties").and_then(|p| p.as_object());
+            for name in required.iter().filter_map(|v| v.as_str()) {
+                checked += 1;
+                if props.is_none_or(|p| !p.contains_key(name)) {
+                    offenders.push(format!("{tool}.{name}"));
+                }
+            }
+        }
+
+        assert!(
+            checked > 10,
+            "only {checked} required parameters inspected — the schema shape \
+             probably changed and this test is no longer looking at anything"
+        );
+        assert!(
+            offenders.is_empty(),
+            "required parameters missing a property definition: {offenders:?}"
+        );
+    }
+
+    /// Every registered tool has to appear in the README.
+    ///
+    /// The count drifted to three different numbers across the repo (26 in the
+    /// architecture page, 27 in the release-post template, 30 in the README)
+    /// precisely because nothing checked. Names rather than a count, so adding
+    /// a tool fails this test instead of silently making a sentence wrong.
+    ///
+    /// Deliberately not asserted against `SERVER_INSTRUCTIONS`: that text is
+    /// guidance an agent pays for on every connection, not an inventory, and
+    /// forcing all 30 names into it would trade agent context for tidiness.
+    #[test]
+    fn every_tool_is_named_in_the_readme() {
+        const README: &str = include_str!("../../README.md");
+
+        let db = crate::db::open_memory().expect("test db");
+        let tools = LificMcp::new(db).list_tool_names();
+
+        assert!(
+            tools.len() > 15,
+            "sanity check: only {} tools found — ToolRouter wiring is probably broken",
+            tools.len()
+        );
+
+        let undocumented: Vec<&String> = tools
+            .iter()
+            .filter(|name| !README.contains(name.as_str()))
+            .collect();
+
+        assert!(
+            undocumented.is_empty(),
+            "these MCP tools are registered but never named in README.md: {undocumented:?}"
+        );
+    }
+}
