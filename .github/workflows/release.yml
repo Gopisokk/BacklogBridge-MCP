@@ -307,8 +307,8 @@ jobs:
             --draft=false \
             --latest
 
-  # Point the Homebrew tap (VoidNullable/homebrew-tap) at this release, so
-  # `brew install voidnullable/tap/lific` and `brew upgrade` pick it up. The
+  # Point the Homebrew tap (Gopisokk/homebrew-tap) at this release, so
+  # `brew install Gopisokk/tap/lific` and `brew upgrade` pick it up. The
   # formula installs the binaries the release job just published, pinned to the
   # hashes in the published sha256sums.txt. See docs/homebrew.md.
   #
@@ -350,7 +350,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         if: env.HAS_TAP_KEY == 'true'
         with:
-          repository: VoidNullable/homebrew-tap
+          repository: Gopisokk/homebrew-tap
           ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
           path: tap
 
@@ -375,9 +375,9 @@ jobs:
         if: env.HAS_TAP_KEY == 'true'
         run: |
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-          brew tap voidnullable/tap "${GITHUB_WORKSPACE}/tap"
-          brew install voidnullable/tap/lific
-          brew test voidnullable/tap/lific
+          brew tap Gopisokk/tap "${GITHUB_WORKSPACE}/tap"
+          brew install Gopisokk/tap/lific
+          brew test Gopisokk/tap/lific
           lific --version | grep -F "lific ${VERSION}"
 
       - name: Push the formula
@@ -447,7 +447,7 @@ jobs:
           ./mcp-publisher --version || true
 
       # GitHub OIDC: the `id-token: write` permission above lets mcp-publisher
-      # prove ownership of the io.github.VoidNullable/* namespace from the
+      # prove ownership of the io.github.Gopisokk/* namespace from the
       # workflow's OIDC token — no stored secret or PAT required. The namespace
       # casing (capital V, N) must match server.json's `name` and the README
       # marker exactly; the registry's namespace check is case-sensitive
@@ -498,3 +498,4 @@ jobs:
           done
           echo "::error::MCP Registry publish did not succeed after retries."
           exit 1
+

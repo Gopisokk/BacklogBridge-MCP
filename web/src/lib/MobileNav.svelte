@@ -612,7 +612,7 @@
       >
         <img src="/logo.webp" alt="" width="28" height="28" class="rounded-md shrink-0" />
         <span class="font-display text-heading tracking-tight text-[var(--text)] leading-none flex-1">
-          Lific
+          Merge
         </span>
         <span
           class="text-micro text-[var(--text-faint)] shrink-0"

@@ -862,23 +862,19 @@
         use:observeSidebarFontSize={(size) => sidebarFontSize = size}></span>
       <!-- Brand header -->
       <div class="px-3 pt-3 pb-2 flex items-center gap-1.5">
-        <a
-          href="https://github.com/VoidNullable/lific"
-          target="_blank"
-          rel="noopener noreferrer"
-          title="View Lific on GitHub"
-          class="sidebar-brand flex flex-1 min-w-0 items-center gap-2.5 px-1 py-1 transition-colors"
+        <div
+          class="sidebar-brand flex flex-1 min-w-0 items-center gap-2.5 px-1 py-1"
         >
           <img src="/logo.webp" alt="" width="26" height="26" class="rounded-md shrink-0" />
           <span class="font-display text-heading tracking-tight text-[var(--text)] leading-none flex-1">
-            Lific
+            Merge
           </span>
           <span
             class="sidebar-version text-micro text-[var(--text-faint)] shrink-0"
           >
             v{__APP_VERSION__}
           </span>
-        </a>
+        </div>
         <!-- LIF-360: collapse control. Sits beside the brand rather than in
              the footer so its position mirrors the expand control that takes
              its place in the topbar. -->
@@ -1301,7 +1297,7 @@
             <span
               class="truncate font-display text-heading tracking-tight text-[var(--text)] leading-none"
             >
-              {mobileSection ?? "Lific"}
+              {mobileSection ?? "Merge"}
             </span>
           </span>
         {/if}

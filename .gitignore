@@ -25,3 +25,13 @@ dev-backend.sh
 .*-autosave.kra
 discord.env
 fly.env
+
+*.db
+*.db-wal
+*.db-shm
+*.toml
+.lific*
+backups/
+web/package-lock.json
+web/node_modules/
+target/
