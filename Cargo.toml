@@ -1,0 +1,210 @@
+[package]
+name = "backlogbridge-mcp"
+version = "2.11.1"
+edition = "2024"
+authors = ["Gopi Rk <gopi030506@gmail.com>"]
+description = "Local-first, lightweight issue tracker and backlog bridge. Single binary, SQLite-backed, MCP-native."
+license = "Apache-2.0"
+repository = "https://github.com/Gopisokk/BacklogBridge-MCP"
+keywords = ["issue-tracker", "project-management", "mcp", "sqlite", "local-first"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.88"
+include = [
+    "src/**/*",
+    "build.rs",
+    "migrations/**/*",
+    "web/dist/**/*",
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+]
+
+[lints.clippy]
+branches_sharing_code = "deny"
+cast_sign_loss = "deny"
+collection_is_never_read = "deny"
+derive_partial_eq_without_eq = "deny"
+format_collect = "deny"
+future_not_send = "deny"
+literal_string_with_formatting_args = "deny"
+map_unwrap_or = "deny"
+match_wildcard_for_single_variants = "deny"
+needless_collect = "deny"
+or_fun_call = "deny"
+redundant_clone = "deny"
+unchecked_duration_subtraction = "deny"
+unnecessary_struct_initialization = "deny"
+unnecessary_wraps = "deny"
+# Defer format-string interpolation cleanup to the dedicated formatting pass.
+uninlined_format_args = "allow"
+useless_let_if_seq = "deny"
+unused_async = "deny"
+
+[features]
+# Build the web UI with Bun during the Cargo build when web/dist is empty, as
+# in a Git checkout: `cargo install --git ... --features build-web`. Needs Bun
+# and network access for `bun install`. Off by default so release builds still
+# fail without a prebuilt frontend and stay hermetic.
+build-web = []
+
+[dependencies]
+# HTTP
+axum = { version = "0.8", features = ["json", "multipart", "ws"] }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+tower-http = { version = "0.6", features = ["cors", "compression-gzip", "compression-br"] }
+# HTTP client — used by `lific doctor` to probe a running server (reachability,
+# OAuth discovery, MCP round-trip). rustls-tls (no OpenSSL linkage) so the
+# static single-binary build stays clean and `public_url` https checks work.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled", "vtab", "backup", "hooks"] }
+crossbeam-queue = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# MCP
+# rmcp breaks its API within minor versions (1.7 changed the JSON-RPC error
+# constructor; 1.8 changed version negotiation and tool argument errors), and
+# `cargo install` ignores Cargo.lock. Upgrade deliberately, not by resolution.
+# rmcp-macros is listed only to hold it to the same minor as rmcp.
+rmcp = { version = "~1.4", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+rmcp-macros = "~1.4"
+schemars = "0.8"
+anyhow = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+
+# Auth
+blake3 = "1"
+argon2 = "0.5"
+rand = "0.8"
+# Credential storage for `lific login` (LIF-258). On Linux we use the
+# Secret Service backend (sync-secret-service) with the pure-Rust crypto
+# session (crypto-rust, no OpenSSL) and `vendored` so libdbus is compiled in
+# statically — CI and headless boxes don't need a system libdbus/pkg-config
+# package. apple-native / windows-native cover macOS Keychain and Windows
+# Credential Manager. When no Secret Service is present at runtime (e.g. a
+# headless server), src/cli/credentials.rs falls back to a 0600
+# ~/.config/lific/credentials.json file with a loud warning.
+keyring = { version = "3", features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+    "crypto-rust",
+    "vendored",
+] }
+
+# Static assets (embedded frontend)
+rust-embed = { version = "8", features = ["mime-guess", "interpolate-folder-path"] }
+mime_guess = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# Backup/restore archive format (LIF-266): `lific dump` / `lific restore`
+# produce a single self-contained tar.gz (gitea-dump style). flate2 is already
+# in the tree transitively; tar is the new direct dep.
+tar = "0.4"
+flate2 = "1"
+
+# Encoding
+urlencoding = "2"
+content_disposition = "0.4"
+# serde_urlencoded: parse application/x-www-form-urlencoded device-authorization
+# bodies by hand (the endpoint accepts BOTH form and JSON, so we sniff the
+# content-type and deserialize the raw bytes rather than committing to one axum
+# extractor). Already in the tree transitively via axum.
+serde_urlencoded = "0.7"
+
+# Config
+toml = "0.8"
+# toml_edit: format-preserving TOML round-trip for `lific connect` writing into
+# Codex's config.toml — inserting only [mcp_servers.lific] while keeping the
+# user's existing keys, comments, and layout intact.
+toml_edit = "0.22"
+dirs = "6"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+subtle = "2"
+base64 = "0.22"
+zeroize = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+hmac = { version = "0.12", features = ["std"] }
+cliclack = "0.5.4"
+console = "0.16.4"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+tempfile = "3"
+fs2 = "0.4"
+# Line diffs for get_page(since_seq) (LIF-480). No dependencies with only the
+# `text` feature; 2.x because 3.x needs a newer toolchain than rust-version.
+similar = { version = "2", default-features = false, features = ["text"] }
+
+# SIGPIPE handling for piped CLI output (see main.rs); unix only.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# The Windows background service (src/cli/service/windows.rs): the per-user
+# Run registry value, the supervisor's named mutex and events, and the job
+# object that keeps the server from outliving its supervisor. Already in the
+# tree transitively (tokio, keyring); this names the features it uses.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }
+
+# Embeds the Windows application manifest (consoleAllocationPolicy) from
+# build.rs, including when cross-linking the MSVC release from Linux.
+[build-dependencies]
+embed-manifest = "1.5"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+proptest = "1"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+# Scratch directories for tests. Replaces hand-rolled
+# `temp_dir().join(format!("..._{}", process::id()))` paths, which were not
+# unique across runs (Linux recycles pids) and were only cleaned up by a
+# trailing `remove_dir_all` that a panicking test skipped, leaving a populated
+# directory for the next run that drew the same pid. `TempDir` is unique per
+# call and removes itself on Drop, including during unwind.
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
+tokio-tungstenite = "0.28"
+# tests/build_contract.rs compiles build.rs as a module.
+embed-manifest = "1.5"
+
+# Argon2 password hashing is memory-hard by design; in unoptimized debug
+# builds each hash/verify costs ~0.4s of CPU, and the test suite performs
+# hundreds of them (every API test that creates a user or logs in). Compiling
+# just the crypto crates with optimizations keeps `cargo test` fast without
+# touching hash parameters or test code. Measured: full suite CPU time
+# dropped from ~42 CPU-minutes to a fraction with this override.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+strip = true
+
+# For distribution builds (AUR, GitHub releases):
+# cargo build --profile dist
+[profile.dist]
+inherits = "release"
+lto = true
+codegen-units = 1
