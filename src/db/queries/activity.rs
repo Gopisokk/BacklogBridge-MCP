@@ -1,0 +1,981 @@
+//! LIF-156: audit-log read surface.
+//!
+//! Capture happens entirely in SQL (migration 018 triggers) — this module
+//! only reads. Every query LEFT JOINs `users` so actor display data rides
+//! along, degrading gracefully when the actor's account is gone.
+
+use rusqlite::Connection;
+use std::collections::HashSet;
+
+use crate::db::models::{Activity, ActivityFeed};
+use crate::error::LificError;
+
+/// Which slice of the audit log to read.
+///
+/// `Issue`/`Page` use the denormalized parent columns, so an issue's feed
+/// naturally includes its comments, label attach/detach, and relation
+/// events — not just edits to the issue row itself.
+#[derive(Debug, Clone, Copy)]
+pub enum ActivityScope {
+    Issue(i64),
+    Page(i64),
+    Project(i64),
+    /// A plan and all of its steps. Step rows are matched by the plan's
+    /// PROJ-PLAN-n identifier (stored as their `entity_label`), so the feed
+    /// includes step history even after a step row is deleted.
+    Plan(i64),
+}
+
+/// Activity caps lower than the shared 500: the feed is a rolling audit tail,
+/// and each row carries old/new value blobs. Public so a transport that has to
+/// compute its own paging hints clamps against this number rather than
+/// restating it.
+pub const MAX_LIMIT: i64 = 200;
+const DEFAULT_LIMIT: i64 = super::DEFAULT_PAGE_LIMIT;
+
+/// Return trailing-24-hour logical mutations for the websocket's initial snapshot.
+/// Multi-field trigger rows are grouped by their realtime invalidation target so
+/// the result uses the same one-update unit as the client counter.
+/// `None` means unrestricted visibility; `Some` limits rows to visible projects.
+pub fn activity_count(
+    conn: &Connection,
+    visible_project_ids: Option<&HashSet<i64>>,
+) -> Result<i64, LificError> {
+    let Some(project_filter) = project_filter(visible_project_ids) else {
+        return Ok(0);
+    };
+
+    let sql = format!(
+        "SELECT COUNT(*) FROM (
+             SELECT 1 FROM audit_log a
+             WHERE a.ts >= datetime('now', '-24 hours'){project_filter}
+             GROUP BY a.ts, a.actor_user_id, a.transport, a.action,
+                      a.project_id, a.issue_id, a.page_id, a.entity_type, a.entity_id
+         )"
+    );
+    conn.prepare_cached(&sql)?
+        .query_row(
+            rusqlite::params_from_iter(visible_project_ids.into_iter().flatten()),
+            |row| row.get(0),
+        )
+        .map_err(LificError::Database)
+}
+
+fn project_filter(visible_project_ids: Option<&HashSet<i64>>) -> Option<String> {
+    match visible_project_ids {
+        None => Some(String::new()),
+        Some(ids) if ids.is_empty() => None,
+        Some(ids) => Some(format!(
+            " AND a.project_id IN ({})",
+            (1..=ids.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Normalize a `since` cursor to the stored audit timestamp form.
+///
+/// `audit_log.ts` is SQLite's `datetime('now')`: UTC, second resolution,
+/// `YYYY-MM-DD HH:MM:SS`. A cursor is read on the same clock: a bare date is
+/// midnight UTC, a datetime without an offset is UTC, and a `Z` or `±HH:MM`
+/// offset is converted to UTC. Fractional seconds are dropped, which keeps
+/// "strictly after" exact against second-resolution rows.
+pub fn normalize_since(input: &str) -> Result<String, LificError> {
+    use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
+    const STORED: &str = "%Y-%m-%d %H:%M:%S";
+    let value = input.trim();
+    if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        return Ok(date.and_time(NaiveTime::MIN).format(STORED).to_string());
+    }
+    if let Ok(instant) = DateTime::parse_from_rfc3339(value) {
+        return Ok(instant.naive_utc().format(STORED).to_string());
+    }
+    let naive = value.replace('T', " ");
+    ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M"]
+        .iter()
+        .find_map(|format| NaiveDateTime::parse_from_str(&naive, format).ok())
+        .map(|instant| instant.format(STORED).to_string())
+        .ok_or_else(|| {
+            LificError::BadRequest(format!(
+                "invalid since '{value}'. Use an ISO date or datetime, e.g. 2026-06-01 or \
+                 2026-06-01T14:30:00Z (UTC unless an offset is given)."
+            ))
+        })
+}
+
+/// List activity newest-first. `limit` is clamped to 1..=200 (default 50).
+/// Fetches limit+1 rows internally to compute `has_more` without a COUNT.
+pub fn list_activity(
+    conn: &Connection,
+    scope: ActivityScope,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<ActivityFeed, LificError> {
+    list_activity_since(conn, scope, None, limit, offset)
+}
+
+/// [`list_activity`] with an optional cursor. With `since` (already passed
+/// through [`normalize_since`]) only entries strictly after it are returned,
+/// oldest-first, so a caller can page forward from where it left off. Without
+/// it the feed is newest-first, as it always was.
+pub fn list_activity_since(
+    conn: &Connection,
+    scope: ActivityScope,
+    since: Option<&str>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<ActivityFeed, LificError> {
+    let (limit, offset) = super::page_with(limit, offset, DEFAULT_LIMIT, MAX_LIMIT);
+
+    // Scope params come first (?1, optionally ?2 for plans); limit/offset are
+    // appended after, so their placeholder indices depend on the scope arity.
+    let mut sp: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let where_clause: String = match scope {
+        ActivityScope::Issue(id) => {
+            sp.push(Box::new(id));
+            "a.issue_id = ?1".into()
+        }
+        ActivityScope::Page(id) => {
+            sp.push(Box::new(id));
+            "a.page_id = ?1".into()
+        }
+        ActivityScope::Project(id) => {
+            sp.push(Box::new(id));
+            "a.project_id = ?1".into()
+        }
+        ActivityScope::Plan(id) => {
+            use rusqlite::OptionalExtension;
+            let ident: String = conn
+                .query_row(
+                    "SELECT p.identifier || '-PLAN-' || pl.sequence
+                     FROM plans pl JOIN projects p ON p.id = pl.project_id
+                     WHERE pl.id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or_default();
+            sp.push(Box::new(id));
+            sp.push(Box::new(ident));
+            "((a.entity_type = 'plan' AND a.entity_id = ?1) \
+              OR (a.entity_type = 'plan_step' AND a.entity_label = ?2))"
+                .into()
+        }
+    };
+
+    // A cursor filters and orders on the timestamp it is compared against, so
+    // imported history (old `ts`, new `id`) still reads in time order.
+    let (where_clause, order) = match since {
+        Some(since) => {
+            sp.push(Box::new(since.to_string()));
+            (
+                format!("({where_clause}) AND a.ts > ?{}", sp.len()),
+                "a.ts ASC, a.id ASC",
+            )
+        }
+        None => (where_clause, "a.id DESC"),
+    };
+
+    let n = sp.len();
+    sp.push(Box::new(super::over_fetch(limit)));
+    sp.push(Box::new(offset));
+
+    let sql = format!(
+        "SELECT a.id, a.ts, a.actor_user_id,
+                COALESCE(a.imported_author, u.username), COALESCE(a.imported_author, u.display_name),
+                COALESCE(u.is_bot, 0), a.transport, a.entity_type, a.entity_id,
+                a.entity_label, a.project_id, a.issue_id, a.page_id,
+                a.action, a.field, a.old_value, a.new_value
+         FROM audit_log a
+         LEFT JOIN users u ON u.id = a.actor_user_id
+         WHERE {where_clause}
+         ORDER BY {order}
+         LIMIT ?{} OFFSET ?{}",
+        n + 1,
+        n + 2,
+    );
+
+    let refs: Vec<&dyn rusqlite::types::ToSql> = sp.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(refs.as_slice(), row_to_activity)?;
+    let items: Vec<Activity> = rows.collect::<Result<Vec<_>, _>>()?;
+
+    // ActivityFeed is the serialized shape the REST feed and the web UI read;
+    // the split itself is the shared one (LIF-388).
+    let page = super::Page::from_over_fetch(items, limit);
+    Ok(ActivityFeed {
+        items: page.items,
+        has_more: page.has_more,
+    })
+}
+
+/// Per-actor rollup for a project: action counts, last-seen, and their
+/// dominant transport. Ordered most-active-first. `actor_user_id` NULL
+/// groups all system/unattributed writes into one row.
+pub fn actor_stats(
+    conn: &Connection,
+    project_id: i64,
+) -> Result<Vec<crate::db::models::ActorStat>, LificError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT a.actor_user_id, u.username, u.display_name, COALESCE(u.is_bot, 0),
+                COUNT(*) AS actions, MAX(a.ts) AS last_ts,
+                (SELECT t.transport FROM audit_log t
+                 WHERE t.project_id = a.project_id
+                   AND t.actor_user_id IS a.actor_user_id
+                 GROUP BY t.transport ORDER BY COUNT(*) DESC LIMIT 1) AS top_transport
+         FROM audit_log a
+         LEFT JOIN users u ON u.id = a.actor_user_id
+         WHERE a.project_id = ?1
+         GROUP BY a.actor_user_id
+         ORDER BY actions DESC",
+    )?;
+    let rows = stmt.query_map([project_id], |row| {
+        Ok(crate::db::models::ActorStat {
+            actor_user_id: row.get(0)?,
+            username: row.get(1)?,
+            display_name: row.get(2)?,
+            is_bot: row.get::<_, i64>(3)? != 0,
+            actions: row.get(4)?,
+            last_ts: row.get(5)?,
+            top_transport: row.get(6)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(LificError::Database)
+}
+
+fn row_to_activity(row: &rusqlite::Row<'_>) -> Result<Activity, rusqlite::Error> {
+    Ok(Activity {
+        id: row.get(0)?,
+        ts: row.get(1)?,
+        actor_user_id: row.get(2)?,
+        actor_username: row.get(3)?,
+        actor_display_name: row.get(4)?,
+        actor_is_bot: row.get::<_, i64>(5)? != 0,
+        transport: row.get(6)?,
+        entity_type: row.get(7)?,
+        entity_id: row.get(8)?,
+        entity_label: row.get(9)?,
+        project_id: row.get(10)?,
+        issue_id: row.get(11)?,
+        page_id: row.get(12)?,
+        action: row.get(13)?,
+        field: row.get(14)?,
+        old_value: row.get(15)?,
+        new_value: row.get(16)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actor::{ActorCtx, Transport};
+    use crate::db::models::*;
+    use crate::db::queries;
+
+    /// Seed a project and return (pool, project_id).
+    fn seeded() -> (crate::db::DbPool, i64) {
+        let pool = crate::db::open_memory().expect("test db");
+        let project = {
+            let conn = pool.write().unwrap();
+            queries::create_project(
+                &conn,
+                &CreateProject {
+                    name: "Audit Test".into(),
+                    identifier: "AUD".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        (pool, project.id)
+    }
+
+    fn new_issue(pid: i64, title: &str) -> CreateIssue {
+        CreateIssue {
+            project_id: pid,
+            title: title.into(),
+            ..Default::default()
+        }
+    }
+
+    fn seed_user(conn: &rusqlite::Connection, username: &str, is_bot: bool) -> i64 {
+        conn.execute(
+            "INSERT INTO users (username, email, password_hash, display_name, is_admin, is_bot)
+             VALUES (?1, ?2, 'x', ?1, 0, ?3)",
+            rusqlite::params![username, format!("{username}@test.local"), is_bot],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn issue_feed(pool: &crate::db::DbPool, issue_id: i64) -> Vec<Activity> {
+        let conn = pool.read().unwrap();
+        list_activity(&conn, ActivityScope::Issue(issue_id), Some(100), None)
+            .unwrap()
+            .items
+    }
+
+    #[test]
+    fn activity_count_filters_to_last_day_and_visible_projects() {
+        let pool = crate::db::open_memory().expect("test db");
+        let (first_project, second_project) = {
+            let conn = pool.write().unwrap();
+            let first = queries::create_project(
+                &conn,
+                &CreateProject {
+                    name: "First".into(),
+                    identifier: "FIRST".into(),
+                    description: String::new(),
+                    emoji: None,
+                    lead_user_id: None,
+                },
+            )
+            .unwrap();
+            let second = queries::create_project(
+                &conn,
+                &CreateProject {
+                    name: "Second".into(),
+                    identifier: "SECND".into(),
+                    description: String::new(),
+                    emoji: None,
+                    lead_user_id: None,
+                },
+            )
+            .unwrap();
+
+            // Exclude setup activity so the fresh issue rows below are the
+            // only events inside the rolling 24-hour window.
+            conn.execute("UPDATE audit_log SET ts = datetime('now', '-25 hours')", [])
+                .unwrap();
+            let issue = queries::create_issue(&conn, &new_issue(first.id, "Fresh first")).unwrap();
+            queries::update_issue(
+                &conn,
+                issue.id,
+                &UpdateIssue {
+                    title: Some("Renamed first".into()),
+                    description: Some("Changed too".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            queries::create_issue(&conn, &new_issue(second.id, "Fresh second one")).unwrap();
+            queries::create_issue(&conn, &new_issue(second.id, "Fresh second two")).unwrap();
+            (first.id, second.id)
+        };
+
+        let conn = pool.read().unwrap();
+        assert_eq!(activity_count(&conn, None).unwrap(), 4);
+        assert_eq!(
+            activity_count(&conn, Some(&HashSet::from([first_project]))).unwrap(),
+            2
+        );
+        assert_eq!(
+            activity_count(&conn, Some(&HashSet::from([second_project]))).unwrap(),
+            2
+        );
+        assert_eq!(activity_count(&conn, Some(&HashSet::new())).unwrap(), 0);
+    }
+
+    // ── Capture: per-field diffs ─────────────────────────
+
+    #[test]
+    fn issue_create_is_audited() {
+        let (pool, pid) = seeded();
+        let conn = pool.write().unwrap();
+        let issue = queries::create_issue(&conn, &new_issue(pid, "First")).unwrap();
+        drop(conn);
+
+        let feed = issue_feed(&pool, issue.id);
+        let create = feed.iter().find(|a| a.action == "create").unwrap();
+        assert_eq!(create.entity_type, "issue");
+        assert_eq!(create.entity_label.as_deref(), Some("AUD-1"));
+        assert_eq!(create.new_value.as_deref(), Some("First"));
+        assert_eq!(create.project_id, Some(pid));
+    }
+
+    #[test]
+    fn issue_update_writes_one_row_per_changed_field() {
+        let (pool, pid) = seeded();
+        let conn = pool.write().unwrap();
+        let issue = queries::create_issue(&conn, &new_issue(pid, "Original")).unwrap();
+
+        queries::update_issue(
+            &conn,
+            issue.id,
+            &UpdateIssue {
+                title: Some("Renamed".into()),
+                status: Some(Status::Active),
+                priority: Some(Priority::High),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let feed = issue_feed(&pool, issue.id);
+        let updates: Vec<&Activity> = feed.iter().filter(|a| a.action == "update").collect();
+        assert_eq!(updates.len(), 3, "one row per changed field: {updates:#?}");
+
+        let status = updates
+            .iter()
+            .find(|a| a.field.as_deref() == Some("status"))
+            .unwrap();
+        assert_eq!(status.old_value.as_deref(), Some("backlog"));
+        assert_eq!(status.new_value.as_deref(), Some("active"));
+
+        let title = updates
+            .iter()
+            .find(|a| a.field.as_deref() == Some("title"))
+            .unwrap();
+        assert_eq!(title.old_value.as_deref(), Some("Original"));
+        assert_eq!(title.new_value.as_deref(), Some("Renamed"));
+    }
+
+    #[test]
+    fn unchanged_fields_produce_no_rows() {
+        let (pool, pid) = seeded();
+        let conn = pool.write().unwrap();
+        let issue = queries::create_issue(&conn, &new_issue(pid, "Same")).unwrap();
+
+        queries::update_issue(
+            &conn,
+            issue.id,
+            &UpdateIssue {
+                title: Some("Same".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let feed = issue_feed(&pool, issue.id);
+        assert!(
+            feed.iter().all(|a| a.action != "update"),
+            "no-op update must not audit: {feed:#?}"
+        );
+    }
+
+    #[test]
+    fn module_change_records_names_not_ids() {
+        let (pool, pid) = seeded();
+        let conn = pool.write().unwrap();
+        let module = queries::create_module(
+            &conn,
+            &CreateModule {
+                project_id: pid,
+                name: "Web UI".into(),
+                description: String::new(),
+                status: "active".into(),
+                emoji: None,
+            },
+        )
+        .unwrap();
+        let issue = queries::create_issue(&conn, &new_issue(pid, "I")).unwrap();
+
+        queries::update_issue(
+            &conn,
+            issue.id,
+            &UpdateIssue {
+                module_id: Some(Some(module.id)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let feed = issue_feed(&pool, issue.id);
+        let row = feed
+            .iter()
+            .find(|a| a.field.as_deref() == Some("module"))
+            .unwrap();
+        assert_eq!(row.old_value, None);
+        assert_eq!(row.new_value.as_deref(), Some("Web UI"));
+    }
+
+    #[test]
+    fn issue_delete_snapshots_label_and_title() {
+        let (pool, pid) = seeded();
+        let conn = pool.write().unwrap();
+        let issue = queries::create_issue(&conn, &new_issue(pid, "Doomed")).unwrap();
+        queries::delete_issue(&conn, issue.id).unwrap();
+        drop(conn);
+
+        let feed = issue_feed(&pool, issue.id);
+        let del = feed
+            .iter()
+            // LIF-438: a delete is now a tombstone, audited as 'deleted'.
+            // 'delete' is reserved for a physical row removal (the retention
+            // purge, or a project delete cascading through the foreign keys).
+            .find(|a| a.action == "delete" && a.entity_type == "issue")
+            .unwrap();
+        assert_eq!(del.entity_label.as_deref(), Some("AUD-1"));
+        assert_eq!(del.old_value.as_deref(), Some("Doomed"));
+    }
+
+    // ── Capture: children land in the parent feed ────────
+
+    #[test]
+    fn comment_and_labels_appear_in_issue_feed() {
+        let (pool, pid) = seeded();
+        let conn = pool.write().unwrap();
+        let user_id = seed_user(&conn, "carol", false);
+        let issue = queries::create_issue(&conn, &new_issue(pid, "Busy")).unwrap();
+        queries::comments::create_comment(
+            &conn,
+            queries::comments::CommentParent::Issue(issue.id),
+            user_id,
+            "hello world",
+        )
+        .unwrap();
+        queries::create_label(
+            &conn,
+            &CreateLabel {
+                project_id: pid,
+                name: "bug".into(),
+                color: "#6B7280".into(),
+            },
+        )
+        .unwrap();
+        queries::update_issue(
+            &conn,
+            issue.id,
+            &UpdateIssue {
+                labels: Some(vec!["bug".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let feed = issue_feed(&pool, issue.id);
+        let comment = feed
+            .iter()
+            .find(|a| a.entity_type == "comment" && a.action == "create")
+            .expect("comment create in issue feed");
+        assert_eq!(comment.new_value.as_deref(), Some("hello world"));
+        assert_eq!(comment.entity_label.as_deref(), Some("AUD-1"));
+
+        let attach = feed
+            .iter()
+            .find(|a| a.action == "attach")
+            .expect("label attach in issue feed");
+        assert_eq!(attach.new_value.as_deref(), Some("bug"));
+    }
+
+    #[test]
+    fn relation_link_records_target_identifier() {
+        let (pool, pid) = seeded();
+        let conn = pool.write().unwrap();
+        let a = queries::create_issue(&conn, &new_issue(pid, "A")).unwrap();
+        let b = queries::create_issue(&conn, &new_issue(pid, "B")).unwrap();
+        queries::link_issues(&conn, a.id, b.id, "blocks").unwrap();
+        queries::unlink_issues(&conn, a.id, b.id).unwrap();
+        drop(conn);
+
+        let feed = issue_feed(&pool, a.id);
+        let link = feed.iter().find(|x| x.action == "link").unwrap();
+        assert_eq!(link.field.as_deref(), Some("blocks"));
+        assert_eq!(link.new_value.as_deref(), Some("AUD-2"));
+        let unlink = feed.iter().find(|x| x.action == "unlink").unwrap();
+        assert_eq!(unlink.old_value.as_deref(), Some("AUD-2"));
+    }
+
+    // ── Capture: pages ───────────────────────────────────
+
+    #[test]
+    fn page_edits_are_audited_with_doc_identifier() {
+        let (pool, pid) = seeded();
+        let conn = pool.write().unwrap();
+        let page = queries::create_page(
+            &conn,
+            &CreatePage {
+                project_id: Some(pid),
+                title: "Notes".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        queries::update_page(
+            &conn,
+            page.id,
+            &UpdatePage {
+                content: Some("# new content".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = pool.read().unwrap();
+        let feed = list_activity(&conn, ActivityScope::Page(page.id), None, None)
+            .unwrap()
+            .items;
+        let edit = feed
+            .iter()
+            .find(|a| a.field.as_deref() == Some("content"))
+            .unwrap();
+        assert_eq!(edit.entity_label.as_deref(), Some("AUD-DOC-1"));
+        assert_eq!(edit.new_value.as_deref(), Some("# new content"));
+    }
+
+    // ── Attribution ──────────────────────────────────────
+
+    #[test]
+    fn stamped_actor_is_attributed_and_joined() {
+        let (pool, pid) = seeded();
+        let conn = pool.write().unwrap();
+        let bot_id = seed_user(&conn, "opencode-blake", true);
+
+        crate::actor::stamp(
+            &conn,
+            &ActorCtx {
+                user_id: Some(bot_id),
+                transport: Transport::Mcp,
+            },
+        );
+        let issue = queries::create_issue(&conn, &new_issue(pid, "By bot")).unwrap();
+        drop(conn);
+
+        let feed = issue_feed(&pool, issue.id);
+        let create = feed.iter().find(|a| a.action == "create").unwrap();
+        assert_eq!(create.actor_user_id, Some(bot_id));
+        assert_eq!(create.actor_username.as_deref(), Some("opencode-blake"));
+        assert!(create.actor_is_bot);
+        assert_eq!(create.transport, "mcp");
+    }
+
+    #[test]
+    fn unstamped_writes_attribute_to_system() {
+        let (pool, pid) = seeded();
+        let conn = pool.write().unwrap();
+        let issue = queries::create_issue(&conn, &new_issue(pid, "Anon")).unwrap();
+        drop(conn);
+
+        let feed = issue_feed(&pool, issue.id);
+        let create = feed.iter().find(|a| a.action == "create").unwrap();
+        assert_eq!(create.actor_user_id, None);
+        assert_eq!(create.transport, "system");
+        assert!(!create.actor_is_bot);
+    }
+
+    #[tokio::test]
+    async fn task_local_scope_flows_through_pool_write() {
+        let (pool, pid) = seeded();
+        let user_id = {
+            let conn = pool.write().unwrap();
+            seed_user(&conn, "dave", false)
+        };
+
+        // The full production path: actor scoped on the task, stamped by
+        // DbPool::write() with no manual intervention.
+        let issue = crate::actor::scope(
+            ActorCtx {
+                user_id: Some(user_id),
+                transport: Transport::Web,
+            },
+            async {
+                let conn = pool.write().unwrap();
+                queries::create_issue(&conn, &new_issue(pid, "Via web")).unwrap()
+            },
+        )
+        .await;
+
+        let feed = issue_feed(&pool, issue.id);
+        let create = feed.iter().find(|a| a.action == "create").unwrap();
+        assert_eq!(create.actor_user_id, Some(user_id));
+        assert_eq!(create.transport, "web");
+        assert_eq!(create.actor_username.as_deref(), Some("dave"));
+    }
+
+    #[test]
+    fn deleted_actor_degrades_gracefully() {
+        let (pool, pid) = seeded();
+        let conn = pool.write().unwrap();
+        let uid = seed_user(&conn, "fleeting", false);
+        crate::actor::stamp(
+            &conn,
+            &ActorCtx {
+                user_id: Some(uid),
+                transport: Transport::Api,
+            },
+        );
+        let issue = queries::create_issue(&conn, &new_issue(pid, "Orphan")).unwrap();
+        conn.execute("DELETE FROM users WHERE id = ?1", [uid])
+            .unwrap();
+        drop(conn);
+
+        let feed = issue_feed(&pool, issue.id);
+        let create = feed.iter().find(|a| a.action == "create").unwrap();
+        assert_eq!(create.actor_user_id, Some(uid), "id survives user deletion");
+        assert_eq!(create.actor_username, None, "join degrades to None");
+    }
+
+    // ── Transactionality ─────────────────────────────────
+
+    #[test]
+    fn rolled_back_writes_audit_nothing() {
+        let (pool, pid) = seeded();
+        let conn = pool.write().unwrap();
+
+        let result: Result<(), crate::error::LificError> =
+            queries::savepoint(&conn, "audit_rb_test", || {
+                queries::create_issue(&conn, &new_issue(pid, "Ghost"))?;
+                Err(crate::error::LificError::BadRequest("abort".into()))
+            });
+        assert!(result.is_err());
+        drop(conn);
+
+        let conn = pool.read().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE entity_type = 'issue' AND new_value = 'Ghost'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "rolled-back create must not be audited");
+    }
+
+    // ── Read surface ─────────────────────────────────────
+
+    #[test]
+    fn project_feed_spans_entities_and_pages_through_results() {
+        let (pool, pid) = seeded();
+        let conn = pool.write().unwrap();
+        for i in 0..5 {
+            queries::create_issue(&conn, &new_issue(pid, &format!("Issue {i}"))).unwrap();
+        }
+        queries::create_module(
+            &conn,
+            &CreateModule {
+                project_id: pid,
+                name: "M".into(),
+                description: String::new(),
+                status: "active".into(),
+                emoji: None,
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = pool.read().unwrap();
+        // Full feed: project create + 5 issue creates + module create = 7
+        let all = list_activity(&conn, ActivityScope::Project(pid), Some(100), None).unwrap();
+        assert_eq!(all.items.len(), 7);
+        assert!(!all.has_more);
+        assert!(all.items.iter().any(|a| a.entity_type == "module"));
+        assert!(all.items.iter().any(|a| a.entity_type == "project"));
+
+        // Newest-first ordering.
+        assert!(all.items.windows(2).all(|w| w[0].id > w[1].id));
+
+        // Paging: 3 + has_more, then offset to the tail.
+        let first = list_activity(&conn, ActivityScope::Project(pid), Some(3), None).unwrap();
+        assert_eq!(first.items.len(), 3);
+        assert!(first.has_more);
+        let rest = list_activity(&conn, ActivityScope::Project(pid), Some(10), Some(3)).unwrap();
+        assert_eq!(rest.items.len(), 4);
+        assert!(!rest.has_more);
+        assert!(first.items.last().unwrap().id > rest.items.first().unwrap().id);
+    }
+
+    #[test]
+    fn actor_stats_rollup_counts_ranks_and_transports() {
+        let (pool, pid) = seeded();
+        let conn = pool.write().unwrap();
+        let alice = seed_user(&conn, "alice", false);
+        let bot = seed_user(&conn, "opencode-alice", true);
+
+        crate::actor::stamp(
+            &conn,
+            &ActorCtx {
+                user_id: Some(alice),
+                transport: Transport::Web,
+            },
+        );
+        queries::create_issue(&conn, &new_issue(pid, "a1")).unwrap();
+        queries::create_issue(&conn, &new_issue(pid, "a2")).unwrap();
+
+        crate::actor::stamp(
+            &conn,
+            &ActorCtx {
+                user_id: Some(bot),
+                transport: Transport::Mcp,
+            },
+        );
+        queries::create_issue(&conn, &new_issue(pid, "b1")).unwrap();
+        queries::create_issue(&conn, &new_issue(pid, "b2")).unwrap();
+        queries::create_issue(&conn, &new_issue(pid, "b3")).unwrap();
+        drop(conn);
+
+        let conn = pool.read().unwrap();
+        let stats = actor_stats(&conn, pid).unwrap();
+        // bot (3) > alice (2) > system (1: the project create itself)
+        assert_eq!(stats.len(), 3, "{stats:#?}");
+        assert_eq!(stats[0].username.as_deref(), Some("opencode-alice"));
+        assert_eq!(stats[0].actions, 3);
+        assert!(stats[0].is_bot);
+        assert_eq!(stats[0].top_transport, "mcp");
+        assert_eq!(stats[1].username.as_deref(), Some("alice"));
+        assert_eq!(stats[1].actions, 2);
+        assert_eq!(stats[1].top_transport, "web");
+        assert_eq!(stats[2].actor_user_id, None, "system bucket last");
+        assert_eq!(stats[2].top_transport, "system");
+    }
+}
+
+#[cfg(test)]
+mod since_tests {
+    //! LIF-482: `since` cursors on the activity feed.
+
+    use super::*;
+    use crate::db::models::*;
+    use crate::db::queries;
+
+    fn project(conn: &Connection) -> i64 {
+        queries::create_project(
+            conn,
+            &CreateProject {
+                name: "Cursor".into(),
+                identifier: "CUR".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .id
+    }
+
+    fn issue(conn: &Connection, project_id: i64, title: &str) -> Issue {
+        queries::create_issue(
+            conn,
+            &CreateIssue {
+                project_id,
+                title: title.into(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_cursor_returns_only_later_entries_oldest_first() {
+        let pool = crate::db::open_memory().expect("test db");
+        let conn = pool.write().unwrap();
+        let pid = project(&conn);
+        let first = issue(&conn, pid, "Before one");
+        issue(&conn, pid, "Before two");
+        // Audit timestamps have one-second resolution, so push the first batch
+        // an hour back rather than sleeping across a second boundary.
+        conn.execute("UPDATE audit_log SET ts = datetime('now', '-2 hours')", [])
+            .unwrap();
+        let cursor: String = conn
+            .query_row("SELECT datetime('now', '-1 hour')", [], |row| row.get(0))
+            .unwrap();
+
+        issue(&conn, pid, "After one");
+        queries::update_issue(
+            &conn,
+            first.id,
+            &UpdateIssue {
+                status: Some(Status::Active),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        issue(&conn, pid, "After two");
+
+        let feed = list_activity_since(
+            &conn,
+            ActivityScope::Project(pid),
+            Some(&cursor),
+            Some(50),
+            None,
+        )
+        .unwrap();
+        let summary: Vec<(String, Option<String>)> = feed
+            .items
+            .iter()
+            .map(|entry| (entry.action.clone(), entry.new_value.clone()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("create".to_string(), Some("After one".to_string())),
+                ("update".to_string(), Some("active".to_string())),
+                ("create".to_string(), Some("After two".to_string())),
+            ]
+        );
+        assert!(feed.items.iter().all(|entry| entry.ts > cursor));
+        assert!(!feed.has_more);
+
+        // Paging still works, forward through the same ascending order.
+        let head = list_activity_since(
+            &conn,
+            ActivityScope::Project(pid),
+            Some(&cursor),
+            Some(2),
+            None,
+        )
+        .unwrap();
+        assert_eq!(head.items.len(), 2);
+        assert!(head.has_more);
+        let tail = list_activity_since(
+            &conn,
+            ActivityScope::Project(pid),
+            Some(&cursor),
+            Some(2),
+            Some(2),
+        )
+        .unwrap();
+        assert_eq!(tail.items.len(), 1);
+        assert_eq!(tail.items[0].new_value.as_deref(), Some("After two"));
+        assert!(!tail.has_more);
+
+        // Without a cursor the feed is newest-first, unchanged.
+        let all = list_activity(&conn, ActivityScope::Project(pid), Some(50), None).unwrap();
+        assert!(all.items.windows(2).all(|pair| pair[0].id > pair[1].id));
+        assert_eq!(all.items.len(), 6, "project + 4 creates + 1 status update");
+    }
+
+    #[test]
+    fn a_cursor_equal_to_an_entry_timestamp_excludes_it() {
+        let pool = crate::db::open_memory().expect("test db");
+        let conn = pool.write().unwrap();
+        let pid = project(&conn);
+        conn.execute("UPDATE audit_log SET ts = '2026-06-01 12:00:00'", [])
+            .unwrap();
+        let feed = list_activity_since(
+            &conn,
+            ActivityScope::Project(pid),
+            Some("2026-06-01 12:00:00"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(feed.items.is_empty(), "strictly after: {:?}", feed.items);
+    }
+
+    #[test]
+    fn cursors_normalize_to_the_stored_utc_form() {
+        for (input, expected) in [
+            ("2026-06-01", "2026-06-01 00:00:00"),
+            ("2026-06-01T14:30", "2026-06-01 14:30:00"),
+            ("2026-06-01 14:30:05", "2026-06-01 14:30:05"),
+            ("2026-06-01T14:30:05.900", "2026-06-01 14:30:05"),
+            ("2026-06-01T14:30:05Z", "2026-06-01 14:30:05"),
+            ("2026-06-01T09:30:05-05:00", "2026-06-01 14:30:05"),
+            ("2026-06-02T01:00:00+02:00", "2026-06-01 23:00:00"),
+        ] {
+            assert_eq!(normalize_since(input).unwrap(), expected, "{input}");
+        }
+        for input in ["", "yesterday", "2026-13-01", "06/01/2026"] {
+            assert!(
+                normalize_since(input).is_err(),
+                "{input} should be rejected"
+            );
+        }
+    }
+}

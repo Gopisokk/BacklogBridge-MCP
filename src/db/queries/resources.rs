@@ -1,0 +1,1181 @@
+use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::db::models::*;
+use crate::error::LificError;
+
+use super::unescape_text;
+
+/// A table [`get_resource_project_id`] can resolve a row in.
+///
+/// LIF-386: the table name is interpolated into the SQL, because SQLite has
+/// no bind parameter for an identifier. The set of legal names is therefore
+/// an enum rather than a string: a caller cannot express an injection in the
+/// first place, so there is nothing to validate at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceTable {
+    Modules,
+    Labels,
+    Folders,
+}
+
+impl ResourceTable {
+    /// The SQL identifier for this table. Every value is a literal written
+    /// right here, which is what makes the interpolation below safe.
+    pub fn as_table(&self) -> &'static str {
+        match self {
+            ResourceTable::Modules => "modules",
+            ResourceTable::Labels => "labels",
+            ResourceTable::Folders => "folders",
+        }
+    }
+}
+
+/// Look up the project_id for a module, label, or folder by its id.
+pub fn get_resource_project_id(
+    conn: &Connection,
+    table: ResourceTable,
+    id: i64,
+) -> Result<i64, LificError> {
+    let table = table.as_table();
+    let sql = format!("SELECT project_id FROM {table} WHERE id = ?1");
+    conn.query_row(&sql, params![id], |row| row.get(0))
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                LificError::NotFound(format!("{table} {id} not found"))
+            }
+            _ => e.into(),
+        })
+}
+
+pub fn resolve_module_name(
+    conn: &Connection,
+    project_id: i64,
+    name: &str,
+) -> Result<i64, LificError> {
+    conn.query_row(
+        "SELECT id FROM modules WHERE project_id = ?1 AND name = ?2 COLLATE NOCASE",
+        params![project_id, name],
+        |row| row.get(0),
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => {
+            LificError::NotFound(format!("module '{name}' not found in project"))
+        }
+        _ => e.into(),
+    })
+}
+
+pub fn resolve_folder_name(
+    conn: &Connection,
+    project_id: i64,
+    name: &str,
+) -> Result<i64, LificError> {
+    conn.query_row(
+        "SELECT id FROM folders WHERE project_id = ?1 AND name = ?2 COLLATE NOCASE",
+        params![project_id, name],
+        |row| row.get(0),
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => {
+            LificError::NotFound(format!("folder '{name}' not found in project"))
+        }
+        _ => e.into(),
+    })
+}
+
+pub fn resolve_label_name(
+    conn: &Connection,
+    project_id: i64,
+    name: &str,
+) -> Result<i64, LificError> {
+    conn.query_row(
+        "SELECT id FROM labels WHERE project_id = ?1 AND name = ?2 COLLATE NOCASE",
+        params![project_id, name],
+        |row| row.get(0),
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => {
+            LificError::NotFound(format!("label '{name}' not found in project"))
+        }
+        _ => e.into(),
+    })
+}
+
+pub fn get_module_name(conn: &Connection, id: i64) -> Result<String, LificError> {
+    conn.prepare_cached("SELECT name FROM modules WHERE id = ?1")?
+        .query_row(params![id], |row| row.get(0))
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                LificError::NotFound(format!("module {id} not found"))
+            }
+            _ => e.into(),
+        })
+}
+
+/// Folder id → name. Used by MCP page output to surface the folder a
+/// page lives in without callers juggling a `list_folders` round-trip.
+pub fn get_folder_name(conn: &Connection, id: i64) -> Result<String, LificError> {
+    conn.query_row(
+        "SELECT name FROM folders WHERE id = ?1",
+        params![id],
+        |row| row.get(0),
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => {
+            LificError::NotFound(format!("folder {id} not found"))
+        }
+        _ => e.into(),
+    })
+}
+
+/// Fetch a single module by id. Used by the web detail route and any
+/// client that already knows the id but not the project — list_modules
+/// requires the project_id up front, which makes URL→data resolution
+/// awkward when you don't have it in hand.
+pub fn get_module(conn: &Connection, id: i64) -> Result<Module, LificError> {
+    conn.query_row(
+        "SELECT id, project_id, name, description, status, emoji, created_at, updated_at
+         FROM modules WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(Module {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                name: row.get(2)?,
+                description: row.get(3)?,
+                status: row.get(4)?,
+                emoji: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
+        },
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => {
+            LificError::NotFound(format!("module {id} not found"))
+        }
+        _ => e.into(),
+    })
+}
+
+pub fn list_modules(conn: &Connection, project_id: i64) -> Result<Vec<Module>, LificError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, project_id, name, description, status, emoji, created_at, updated_at
+         FROM modules WHERE project_id = ?1 ORDER BY name",
+    )?;
+    let rows = stmt.query_map(params![project_id], |row| {
+        Ok(Module {
+            id: row.get(0)?,
+            project_id: row.get(1)?,
+            name: row.get(2)?,
+            description: row.get(3)?,
+            status: row.get(4)?,
+            emoji: row.get(5)?,
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// LIF-397: module status is stored as TEXT, but only these six values are
+/// documented, shown by the UI, and promised by the MCP `manage_resource`
+/// schema. Reject anything else at the query boundary so REST, MCP, and the
+/// CLI all get the same contract (mirrors how issue status became a real
+/// type in 286d4ac; modules keep the lighter String representation because
+/// nothing branches on module status server-side).
+const MODULE_STATUSES: [&str; 6] = [
+    "backlog",
+    "planned",
+    "active",
+    "paused",
+    "done",
+    "cancelled",
+];
+
+fn validate_module_status(status: &str) -> Result<(), LificError> {
+    if MODULE_STATUSES.contains(&status) {
+        Ok(())
+    } else {
+        Err(LificError::BadRequest(format!(
+            "invalid module status '{status}'. Use backlog, planned, active, paused, done, or cancelled."
+        )))
+    }
+}
+
+pub fn create_module(conn: &Connection, input: &CreateModule) -> Result<Module, LificError> {
+    validate_module_status(&input.status)?;
+    conn.execute(
+        "INSERT INTO modules (project_id, name, description, status, emoji) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            input.project_id,
+            input.name,
+            unescape_text(&input.description),
+            input.status,
+            input.emoji,
+        ],
+    )?;
+    let id = conn.last_insert_rowid();
+    conn.query_row(
+        "SELECT id, project_id, name, description, status, emoji, created_at, updated_at FROM modules WHERE id = ?1",
+        params![id],
+        |row| Ok(Module {
+            id: row.get(0)?, project_id: row.get(1)?, name: row.get(2)?,
+            description: row.get(3)?, status: row.get(4)?, emoji: row.get(5)?,
+            created_at: row.get(6)?, updated_at: row.get(7)?,
+        }),
+    ).map_err(Into::into)
+}
+
+pub fn update_module(
+    conn: &Connection,
+    id: i64,
+    input: &UpdateModule,
+) -> Result<Module, LificError> {
+    super::savepoint(conn, "update_module", || {
+        if let Some(ref name) = input.name {
+            conn.execute(
+                "UPDATE modules SET name = ?1 WHERE id = ?2",
+                params![name, id],
+            )?;
+        }
+        if let Some(ref description) = input.description {
+            conn.execute(
+                "UPDATE modules SET description = ?1 WHERE id = ?2",
+                params![unescape_text(description), id],
+            )?;
+        }
+        if let Some(ref status) = input.status {
+            validate_module_status(status)?;
+            conn.execute(
+                "UPDATE modules SET status = ?1 WHERE id = ?2",
+                params![status, id],
+            )?;
+        }
+        // Tristate: Some(None) clears to NULL, Some(Some) sets, None skips.
+        if let Some(emoji) = &input.emoji {
+            conn.execute(
+                "UPDATE modules SET emoji = ?1 WHERE id = ?2",
+                params![emoji.as_ref(), id],
+            )?;
+        }
+        Ok(())
+    })?;
+    conn.query_row(
+        "SELECT id, project_id, name, description, status, emoji, created_at, updated_at FROM modules WHERE id = ?1",
+        params![id],
+        |row| Ok(Module {
+            id: row.get(0)?, project_id: row.get(1)?, name: row.get(2)?,
+            description: row.get(3)?, status: row.get(4)?, emoji: row.get(5)?,
+            created_at: row.get(6)?, updated_at: row.get(7)?,
+        }),
+    ).map_err(|e| match e { rusqlite::Error::QueryReturnedNoRows => LificError::NotFound(format!("module {id} not found")), _ => e.into() })
+}
+
+pub fn delete_module(conn: &Connection, id: i64) -> Result<(), LificError> {
+    let changed = conn.execute("DELETE FROM modules WHERE id = ?1", params![id])?;
+    if changed == 0 {
+        return Err(LificError::NotFound(format!("module {id} not found")));
+    }
+    Ok(())
+}
+
+pub fn list_labels(conn: &Connection, project_id: i64) -> Result<Vec<Label>, LificError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, project_id, name, color FROM labels WHERE project_id = ?1 ORDER BY name",
+    )?;
+    let rows = stmt.query_map(params![project_id], |row| {
+        Ok(Label {
+            id: row.get(0)?,
+            project_id: row.get(1)?,
+            name: row.get(2)?,
+            color: row.get(3)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+pub fn create_label(conn: &Connection, input: &CreateLabel) -> Result<Label, LificError> {
+    conn.execute(
+        "INSERT INTO labels (project_id, name, color) VALUES (?1, ?2, ?3)",
+        params![input.project_id, input.name, input.color],
+    )?;
+    Ok(Label {
+        id: conn.last_insert_rowid(),
+        project_id: input.project_id,
+        name: input.name.clone(),
+        color: input.color.clone(),
+    })
+}
+
+pub fn update_label(conn: &Connection, id: i64, input: &UpdateLabel) -> Result<Label, LificError> {
+    super::savepoint(conn, "update_label", || {
+        if let Some(ref name) = input.name {
+            conn.execute(
+                "UPDATE labels SET name = ?1 WHERE id = ?2",
+                params![name, id],
+            )?;
+        }
+        if let Some(ref color) = input.color {
+            conn.execute(
+                "UPDATE labels SET color = ?1 WHERE id = ?2",
+                params![color, id],
+            )?;
+        }
+        Ok(())
+    })?;
+    conn.query_row(
+        "SELECT id, project_id, name, color FROM labels WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(Label {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                name: row.get(2)?,
+                color: row.get(3)?,
+            })
+        },
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => {
+            LificError::NotFound(format!("label {id} not found"))
+        }
+        _ => e.into(),
+    })
+}
+
+pub fn delete_label(conn: &Connection, id: i64) -> Result<(), LificError> {
+    let changed = conn.execute("DELETE FROM labels WHERE id = ?1", params![id])?;
+    if changed == 0 {
+        return Err(LificError::NotFound(format!("label {id} not found")));
+    }
+    Ok(())
+}
+
+/// Merge `source_id` into `target_id`: every issue/page wearing the source
+/// label is re-pointed at the target (deduped via INSERT OR IGNORE so an
+/// object already carrying both doesn't violate the composite PK), then the
+/// source label is deleted. Atomic via savepoint. Returns the surviving
+/// target label. The attach/detach triggers fire naturally, so the audit log
+/// records the reassignment and issue `updated_at` bumps as usual.
+pub fn merge_label(conn: &Connection, source_id: i64, target_id: i64) -> Result<Label, LificError> {
+    if source_id == target_id {
+        return Err(LificError::BadRequest(
+            "cannot merge a label into itself".into(),
+        ));
+    }
+    super::savepoint(conn, "merge_label", || {
+        conn.execute(
+            "INSERT OR IGNORE INTO issue_labels (issue_id, label_id)
+             SELECT issue_id, ?1 FROM issue_labels WHERE label_id = ?2",
+            params![target_id, source_id],
+        )?;
+        conn.execute(
+            "DELETE FROM issue_labels WHERE label_id = ?1",
+            params![source_id],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO page_labels (page_id, label_id)
+             SELECT page_id, ?1 FROM page_labels WHERE label_id = ?2",
+            params![target_id, source_id],
+        )?;
+        conn.execute(
+            "DELETE FROM page_labels WHERE label_id = ?1",
+            params![source_id],
+        )?;
+        let changed = conn.execute("DELETE FROM labels WHERE id = ?1", params![source_id])?;
+        if changed == 0 {
+            return Err(LificError::NotFound(format!("label {source_id} not found")));
+        }
+        Ok(())
+    })?;
+    conn.query_row(
+        "SELECT id, project_id, name, color FROM labels WHERE id = ?1",
+        params![target_id],
+        |row| {
+            Ok(Label {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                name: row.get(2)?,
+                color: row.get(3)?,
+            })
+        },
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => {
+            LificError::NotFound(format!("label {target_id} not found"))
+        }
+        _ => e.into(),
+    })
+}
+
+pub fn list_folders(conn: &Connection, project_id: i64) -> Result<Vec<Folder>, LificError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, project_id, parent_id, name, sort_order FROM folders WHERE project_id = ?1 ORDER BY sort_order, name",
+    )?;
+    let rows = stmt.query_map(params![project_id], |row| {
+        Ok(Folder {
+            id: row.get(0)?,
+            project_id: row.get(1)?,
+            parent_id: row.get(2)?,
+            name: row.get(3)?,
+            sort_order: row.get(4)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+pub fn create_folder(conn: &Connection, input: &CreateFolder) -> Result<Folder, LificError> {
+    if let Some(parent_id) = input.parent_id {
+        let parent_project_id: Option<i64> = conn
+            .query_row(
+                "SELECT project_id FROM folders WHERE id = ?1",
+                params![parent_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(parent_project_id) = parent_project_id
+            && parent_project_id != input.project_id
+        {
+            return Err(LificError::BadRequest(format!(
+                "parent folder {parent_id} belongs to project {parent_project_id}, not project {}",
+                input.project_id
+            )));
+        }
+    }
+    conn.execute(
+        "INSERT INTO folders (project_id, parent_id, name) VALUES (?1, ?2, ?3)",
+        params![input.project_id, input.parent_id, input.name],
+    )?;
+    Ok(Folder {
+        id: conn.last_insert_rowid(),
+        project_id: input.project_id,
+        parent_id: input.parent_id,
+        name: input.name.clone(),
+        sort_order: 0.0,
+    })
+}
+
+pub fn update_folder(
+    conn: &Connection,
+    id: i64,
+    input: &UpdateFolder,
+) -> Result<Folder, LificError> {
+    if let Some(ref name) = input.name {
+        conn.execute(
+            "UPDATE folders SET name = ?1 WHERE id = ?2",
+            params![name, id],
+        )?;
+    }
+    conn.query_row(
+        "SELECT id, project_id, parent_id, name, sort_order FROM folders WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(Folder {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                parent_id: row.get(2)?,
+                name: row.get(3)?,
+                sort_order: row.get(4)?,
+            })
+        },
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => {
+            LificError::NotFound(format!("folder {id} not found"))
+        }
+        _ => e.into(),
+    })
+}
+
+pub fn delete_folder(conn: &Connection, id: i64) -> Result<(), LificError> {
+    let changed = conn.execute("DELETE FROM folders WHERE id = ?1", params![id])?;
+    if changed == 0 {
+        return Err(LificError::NotFound(format!("folder {id} not found")));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+    use crate::db::queries::projects;
+
+    fn test_db() -> db::DbPool {
+        db::open_memory().expect("test db")
+    }
+
+    fn seed_project(conn: &rusqlite::Connection) -> i64 {
+        projects::create_project(
+            conn,
+            &CreateProject {
+                name: "Test".into(),
+                identifier: "TST".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .id
+    }
+
+    #[test]
+    fn module_crud() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn);
+
+        let module = create_module(
+            &conn,
+            &CreateModule {
+                project_id: pid,
+                name: "Core".into(),
+                description: "The core".into(),
+                status: "active".into(),
+                emoji: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(module.name, "Core");
+        assert_eq!(module.status, "active");
+
+        let updated = update_module(
+            &conn,
+            module.id,
+            &UpdateModule {
+                name: Some("Core DB".into()),
+                status: Some("done".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.name, "Core DB");
+        assert_eq!(updated.status, "done");
+
+        let modules = list_modules(&conn, pid).unwrap();
+        assert_eq!(modules.len(), 1);
+
+        delete_module(&conn, module.id).unwrap();
+        assert_eq!(list_modules(&conn, pid).unwrap().len(), 0);
+    }
+
+    /// LIF-397: docs and the MCP schema promise six module statuses, but the
+    /// column is TEXT and used to take anything ("bananas" included). The six
+    /// documented values round-trip; everything else is a BadRequest naming
+    /// them, on both create and update, and a rejected update leaves the row
+    /// untouched.
+    #[test]
+    fn module_status_rejects_undocumented_values() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn);
+
+        let err = create_module(
+            &conn,
+            &CreateModule {
+                project_id: pid,
+                name: "Bad".into(),
+                description: String::new(),
+                status: "bananas".into(),
+                emoji: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, LificError::BadRequest(_)), "got: {err:?}");
+        assert!(
+            err.to_string().contains("paused"),
+            "error must list the six: {err}"
+        );
+
+        let module = create_module(
+            &conn,
+            &CreateModule {
+                project_id: pid,
+                name: "Guarded".into(),
+                description: String::new(),
+                status: "backlog".into(),
+                emoji: None,
+            },
+        )
+        .unwrap();
+        for status in [
+            "backlog",
+            "planned",
+            "active",
+            "paused",
+            "done",
+            "cancelled",
+        ] {
+            update_module(
+                &conn,
+                module.id,
+                &UpdateModule {
+                    status: Some(status.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let err = update_module(
+            &conn,
+            module.id,
+            &UpdateModule {
+                status: Some("shipped".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, LificError::BadRequest(_)), "got: {err:?}");
+        // The rejected update must not have altered the stored status.
+        assert_eq!(get_module(&conn, module.id).unwrap().status, "cancelled");
+    }
+
+    #[test]
+    fn get_module_by_id_round_trip() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn);
+
+        let created = create_module(
+            &conn,
+            &CreateModule {
+                project_id: pid,
+                name: "Auth".into(),
+                description: "Login + tokens".into(),
+                status: "planned".into(),
+                emoji: None,
+            },
+        )
+        .unwrap();
+
+        let fetched = get_module(&conn, created.id).unwrap();
+        assert_eq!(fetched.id, created.id);
+        assert_eq!(fetched.name, "Auth");
+        assert_eq!(fetched.description, "Login + tokens");
+        assert_eq!(fetched.status, "planned");
+        assert_eq!(fetched.project_id, pid);
+    }
+
+    #[test]
+    fn get_module_not_found_returns_404_kind() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let err = get_module(&conn, 99_999).unwrap_err();
+        assert!(matches!(err, LificError::NotFound(_)));
+    }
+
+    #[test]
+    fn resolve_module_name_case_insensitive() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn);
+        let module = create_module(
+            &conn,
+            &CreateModule {
+                project_id: pid,
+                name: "Authentication".into(),
+                description: String::new(),
+                status: "active".into(),
+                emoji: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_module_name(&conn, pid, "Authentication").unwrap(),
+            module.id
+        );
+        assert_eq!(
+            resolve_module_name(&conn, pid, "authentication").unwrap(),
+            module.id
+        );
+        assert_eq!(
+            resolve_module_name(&conn, pid, "AUTHENTICATION").unwrap(),
+            module.id
+        );
+        assert!(resolve_module_name(&conn, pid, "nonexistent").is_err());
+    }
+
+    #[test]
+    fn get_module_name_by_id() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn);
+        let module = create_module(
+            &conn,
+            &CreateModule {
+                project_id: pid,
+                name: "MCP Server".into(),
+                description: String::new(),
+                status: "active".into(),
+                emoji: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(get_module_name(&conn, module.id).unwrap(), "MCP Server");
+        assert!(get_module_name(&conn, 99999).is_err());
+    }
+
+    #[test]
+    fn label_crud() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn);
+
+        let label = create_label(
+            &conn,
+            &CreateLabel {
+                project_id: pid,
+                name: "bug".into(),
+                color: "#EF4444".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(label.name, "bug");
+        assert_eq!(label.color, "#EF4444");
+
+        let labels = list_labels(&conn, pid).unwrap();
+        assert_eq!(labels.len(), 1);
+
+        delete_label(&conn, label.id).unwrap();
+        assert_eq!(list_labels(&conn, pid).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn update_label_fields() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn);
+        let label = create_label(
+            &conn,
+            &CreateLabel {
+                project_id: pid,
+                name: "bug".into(),
+                color: "#EF4444".into(),
+            },
+        )
+        .unwrap();
+
+        let updated = update_label(
+            &conn,
+            label.id,
+            &UpdateLabel {
+                name: Some("defect".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.name, "defect");
+        assert_eq!(updated.color, "#EF4444"); // unchanged
+
+        let updated = update_label(
+            &conn,
+            label.id,
+            &UpdateLabel {
+                color: Some("#FF0000".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.name, "defect"); // unchanged
+        assert_eq!(updated.color, "#FF0000");
+    }
+
+    #[test]
+    fn merge_label_moves_attachments_and_dedups() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn);
+        let bug = create_label(
+            &conn,
+            &CreateLabel {
+                project_id: pid,
+                name: "bug".into(),
+                color: "#EF4444".into(),
+            },
+        )
+        .unwrap();
+        let defect = create_label(
+            &conn,
+            &CreateLabel {
+                project_id: pid,
+                name: "defect".into(),
+                color: "#F97316".into(),
+            },
+        )
+        .unwrap();
+
+        // Issue A carries only the source label.
+        let a = crate::db::queries::create_issue(
+            &conn,
+            &CreateIssue {
+                project_id: pid,
+                title: "A".into(),
+                labels: vec!["bug".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Issue B carries BOTH — the merge must dedup, not double-insert.
+        let b = crate::db::queries::create_issue(
+            &conn,
+            &CreateIssue {
+                project_id: pid,
+                title: "B".into(),
+                labels: vec!["bug".into(), "defect".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let survivor = merge_label(&conn, bug.id, defect.id).unwrap();
+        assert_eq!(survivor.id, defect.id);
+
+        // Source label is gone; only the target remains.
+        let labels = list_labels(&conn, pid).unwrap();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].name, "defect");
+
+        // A was re-pointed; B kept exactly one copy of the target.
+        let a2 = crate::db::queries::get_issue(&conn, a.id).unwrap();
+        assert_eq!(a2.labels, vec!["defect".to_string()]);
+        let b2 = crate::db::queries::get_issue(&conn, b.id).unwrap();
+        assert_eq!(b2.labels, vec!["defect".to_string()]);
+    }
+
+    #[test]
+    fn merge_label_into_itself_errors() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn);
+        let l = create_label(
+            &conn,
+            &CreateLabel {
+                project_id: pid,
+                name: "bug".into(),
+                color: "#EF4444".into(),
+            },
+        )
+        .unwrap();
+        let err = merge_label(&conn, l.id, l.id).unwrap_err();
+        assert!(matches!(err, LificError::BadRequest(_)));
+    }
+
+    #[test]
+    fn update_folder_name() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn);
+        let folder = create_folder(
+            &conn,
+            &CreateFolder {
+                project_id: pid,
+                parent_id: None,
+                name: "Docs".into(),
+            },
+        )
+        .unwrap();
+
+        let updated = update_folder(
+            &conn,
+            folder.id,
+            &UpdateFolder {
+                name: Some("Documentation".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.name, "Documentation");
+    }
+
+    #[test]
+    fn resolve_label_name_case_insensitive() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn);
+        let label = create_label(
+            &conn,
+            &CreateLabel {
+                project_id: pid,
+                name: "Feature".into(),
+                color: "#22C55E".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolve_label_name(&conn, pid, "Feature").unwrap(), label.id);
+        assert_eq!(resolve_label_name(&conn, pid, "feature").unwrap(), label.id);
+        assert!(resolve_label_name(&conn, pid, "nope").is_err());
+    }
+
+    #[test]
+    fn folder_crud() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn);
+
+        let folder = create_folder(
+            &conn,
+            &CreateFolder {
+                project_id: pid,
+                parent_id: None,
+                name: "Docs".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(folder.name, "Docs");
+
+        let folders = list_folders(&conn, pid).unwrap();
+        assert_eq!(folders.len(), 1);
+
+        delete_folder(&conn, folder.id).unwrap();
+        assert_eq!(list_folders(&conn, pid).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn create_folder_rejects_parent_from_another_project() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let project_id = seed_project(&conn);
+        let other_project_id = projects::create_project(
+            &conn,
+            &CreateProject {
+                name: "Other".into(),
+                identifier: "OTH".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .id;
+        let parent = create_folder(
+            &conn,
+            &CreateFolder {
+                project_id: other_project_id,
+                parent_id: None,
+                name: "Other docs".into(),
+            },
+        )
+        .unwrap();
+
+        let err = create_folder(
+            &conn,
+            &CreateFolder {
+                project_id,
+                parent_id: Some(parent.id),
+                name: "Invalid child".into(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, LificError::BadRequest(message) if message.contains("belongs to project"))
+        );
+        assert!(list_folders(&conn, project_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_folder_name_case_insensitive() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn);
+        let folder = create_folder(
+            &conn,
+            &CreateFolder {
+                project_id: pid,
+                parent_id: None,
+                name: "Architecture".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_folder_name(&conn, pid, "Architecture").unwrap(),
+            folder.id
+        );
+        assert_eq!(
+            resolve_folder_name(&conn, pid, "architecture").unwrap(),
+            folder.id
+        );
+        assert!(resolve_folder_name(&conn, pid, "nope").is_err());
+    }
+
+    #[test]
+    fn module_unescape_description() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn);
+        let module = create_module(
+            &conn,
+            &CreateModule {
+                project_id: pid,
+                name: "Test".into(),
+                description: "line1\\nline2".into(),
+                status: "active".into(),
+                emoji: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(module.description, "line1\nline2");
+    }
+
+    #[test]
+    fn module_emoji_set_and_clear() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn);
+
+        // Create with an icon.
+        let module = create_module(
+            &conn,
+            &CreateModule {
+                project_id: pid,
+                name: "Icons".into(),
+                description: String::new(),
+                status: "active".into(),
+                emoji: Some("lucide:Rocket".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(module.emoji.as_deref(), Some("lucide:Rocket"));
+        // Survives a round-trip read.
+        assert_eq!(
+            get_module(&conn, module.id).unwrap().emoji.as_deref(),
+            Some("lucide:Rocket")
+        );
+
+        // Change to a literal emoji.
+        let updated = update_module(
+            &conn,
+            module.id,
+            &UpdateModule {
+                emoji: Some(Some("🚀".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.emoji.as_deref(), Some("🚀"));
+
+        // Absent emoji field preserves the existing value.
+        let preserved = update_module(
+            &conn,
+            module.id,
+            &UpdateModule {
+                name: Some("Icons!".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(preserved.emoji.as_deref(), Some("🚀"));
+
+        // Explicit null clears it.
+        let cleared = update_module(
+            &conn,
+            module.id,
+            &UpdateModule {
+                emoji: Some(None),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(cleared.emoji, None);
+    }
+
+    // ── Coverage backfill: previously-untested lookups & guards ──
+
+    // get_resource_project_id interpolates the table name into SQL, so the
+    // name may only ever come from `ResourceTable` (LIF-386). An unknown
+    // table is not rejected at runtime any more, it is unrepresentable: the
+    // enum's every value is one of the three literals asserted below, and a
+    // caller has no other way to name a table.
+    #[test]
+    fn get_resource_project_id_resolves_and_rejects_bad_table() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn);
+        let module = create_module(
+            &conn,
+            &CreateModule {
+                project_id: pid,
+                name: "M".into(),
+                description: String::new(),
+                status: "active".into(),
+                emoji: None,
+            },
+        )
+        .unwrap();
+        let label = create_label(
+            &conn,
+            &CreateLabel {
+                project_id: pid,
+                name: "bug".into(),
+                color: "#EF4444".into(),
+            },
+        )
+        .unwrap();
+        let folder = create_folder(
+            &conn,
+            &CreateFolder {
+                project_id: pid,
+                parent_id: None,
+                name: "Docs".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            get_resource_project_id(&conn, ResourceTable::Modules, module.id).unwrap(),
+            pid
+        );
+        assert_eq!(
+            get_resource_project_id(&conn, ResourceTable::Labels, label.id).unwrap(),
+            pid
+        );
+        assert_eq!(
+            get_resource_project_id(&conn, ResourceTable::Folders, folder.id).unwrap(),
+            pid
+        );
+
+        // The only table names reachable from the enum are these three bare
+        // identifiers, so no call site can smuggle SQL in through the name.
+        for table in [
+            ResourceTable::Modules,
+            ResourceTable::Labels,
+            ResourceTable::Folders,
+        ] {
+            let name = table.as_table();
+            assert!(
+                ["modules", "labels", "folders"].contains(&name),
+                "unexpected table identifier: {name}"
+            );
+            assert!(
+                name.chars().all(|c| c.is_ascii_lowercase()),
+                "table identifier must be a bare identifier, got {name}"
+            );
+        }
+
+        // Known table, missing row → NotFound.
+        let err = get_resource_project_id(&conn, ResourceTable::Modules, 999_999).unwrap_err();
+        assert!(matches!(err, LificError::NotFound(_)));
+    }
+
+    #[test]
+    fn get_folder_name_returns_name_and_404s() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn);
+        let folder = create_folder(
+            &conn,
+            &CreateFolder {
+                project_id: pid,
+                parent_id: None,
+                name: "Design".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(get_folder_name(&conn, folder.id).unwrap(), "Design");
+        let err = get_folder_name(&conn, 999_999).unwrap_err();
+        assert!(matches!(err, LificError::NotFound(_)));
+    }
+}

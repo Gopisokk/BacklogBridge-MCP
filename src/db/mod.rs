@@ -1,0 +1,457 @@
+pub mod migrate;
+pub mod models;
+pub mod queries;
+
+use crossbeam_queue::ArrayQueue;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use crate::error::LificError;
+
+/// Number of read connections in the pool.
+/// SQLite WAL mode supports unlimited concurrent readers.
+const READ_POOL_SIZE: usize = 8;
+
+/// Database pool with read/write splitting.
+///
+/// SQLite allows concurrent reads but only one writer at a time.
+/// - Writes go through a single Mutex-protected connection.
+/// - Reads pull from a lock-free pool of read-only connections.
+/// - Readers never block each other. Readers never block writers.
+#[derive(Clone)]
+pub struct DbPool {
+    writer: Arc<Mutex<Connection>>,
+    readers: Arc<ArrayQueue<Connection>>,
+    path: PathBuf,
+    export_slots: Arc<Semaphore>,
+    /// LIF-467: whole-project archive export/import. One at a time per
+    /// instance, on its own semaphore rather than sharing `export_slots`,
+    /// because an archive run holds a temp file, the attachment-store lock
+    /// and (on import) the single writer for its whole duration. Letting two
+    /// share the ordinary export budget would let one archive starve every
+    /// issue/page export on the instance.
+    archive_slots: Arc<Semaphore>,
+}
+
+/// RAII guard that returns the read connection to the pool on drop.
+pub struct ReadConn {
+    conn: Option<Connection>,
+    pool: Arc<ArrayQueue<Connection>>,
+}
+
+impl std::ops::Deref for ReadConn {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().unwrap()
+    }
+}
+
+impl Drop for ReadConn {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            // Best-effort return to pool; if full, connection is dropped
+            let _ = self.pool.push(conn);
+        }
+    }
+}
+
+impl DbPool {
+    pub(crate) fn acquire_export_slot(&self) -> Result<OwnedSemaphorePermit, LificError> {
+        self.export_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| LificError::TooManyRequests("too many exports are already running".into()))
+    }
+
+    /// The single project-archive slot. Acquired before any body is read or
+    /// any temp file is created, so a rejected request costs nothing.
+    pub(crate) fn acquire_archive_slot(&self) -> Result<OwnedSemaphorePermit, LificError> {
+        self.archive_slots.clone().try_acquire_owned().map_err(|_| {
+            LificError::TooManyRequests("another project archive is already running".into())
+        })
+    }
+
+    /// The database file this pool was opened from. Callers that need to
+    /// place sidecar data next to the database (attachments, backups) resolve
+    /// it from here rather than re-reading the config, so every consumer of a
+    /// given pool agrees on the same data directory. For an in-memory test
+    /// pool this is the `file:...?mode=memory` URI, which has no parent
+    /// directory.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Acquire a read-only connection from the pool.
+    pub fn read(&self) -> Result<ReadConn, LificError> {
+        match self.readers.pop() {
+            Some(conn) => Ok(ReadConn {
+                conn: Some(conn),
+                pool: Arc::clone(&self.readers),
+            }),
+            None => {
+                // Pool exhausted — open a fresh read connection
+                let conn = open_read_connection(&self.path)?;
+                Ok(ReadConn {
+                    conn: Some(conn),
+                    pool: Arc::clone(&self.readers),
+                })
+            }
+        }
+    }
+
+    fn lock_writer(&self) -> Result<std::sync::MutexGuard<'_, Connection>, LificError> {
+        self.writer
+            .lock()
+            .map_err(|error| LificError::Internal(format!("write lock poisoned: {error}")))
+    }
+
+    /// Acquire the exclusive write connection.
+    ///
+    /// LIF-155: stamps the current actor context (task-local set by the
+    /// REST middleware / MCP wrapper / CLI default) onto `_actor_state`
+    /// so the audit triggers attribute every write that follows. The
+    /// exclusive guard makes the stamp race-free: nobody else can write
+    /// between the stamp and the mutation.
+    pub fn write(&self) -> Result<std::sync::MutexGuard<'_, Connection>, LificError> {
+        let connection = self.lock_writer()?;
+        crate::actor::stamp(&connection, &crate::actor::current());
+        Ok(connection)
+    }
+
+    /// Run a write operation in an immediate SQLite transaction.
+    ///
+    /// The immediate lock serializes the caller's reads and writes with
+    /// writers in other processes. Errors roll back on drop.
+    pub fn transaction<T>(
+        &self,
+        operation: impl FnOnce(&Transaction<'_>) -> Result<T, LificError>,
+    ) -> Result<T, LificError> {
+        let mut connection = self.lock_writer()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        crate::actor::stamp(&transaction, &crate::actor::current());
+        let result = operation(&transaction)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+}
+
+fn apply_pragmas(conn: &Connection) -> Result<(), LificError> {
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA foreign_keys = ON;
+         PRAGMA busy_timeout = 5000;
+         PRAGMA cache_size = -8000;
+         PRAGMA mmap_size = 67108864;",
+    )?;
+    // Match the read pool's statement-cache headroom so prepare_cached()
+    // on the write connection (used for many reads in CLI/tests too) keeps
+    // every distinct static query compiled. See open_read_connection().
+    conn.set_prepared_statement_cache_capacity(64);
+    Ok(())
+}
+
+/// Disable SQLite's memory-usage statistics before the first connection is
+/// created. When memstatus is on (the default), every sqlite3 malloc/free in
+/// the entire process serializes on one global mutex (`mem0`) — with many
+/// threads (e.g. the parallel test runner) this becomes a futex storm that
+/// burns more CPU in the kernel than the actual queries. We never read
+/// sqlite3_memory_used(), so the stats are pure overhead. Must run before
+/// SQLite initializes; once it has, the call returns SQLITE_MISUSE and is a
+/// harmless no-op.
+fn disable_sqlite_memstatus() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        rusqlite::ffi::sqlite3_config(rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS, 0i32);
+    });
+}
+
+fn open_read_connection(path: &Path) -> Result<Connection, LificError> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA foreign_keys = ON;
+         PRAGMA busy_timeout = 5000;
+         PRAGMA cache_size = -4000;
+         PRAGMA mmap_size = 67108864;",
+    )?;
+    // Hold every distinct static read query the pool runs without LRU
+    // eviction. The query layer leans on prepare_cached() to skip SQL
+    // recompilation (~2µs/statement → ~80ns cache hit); rusqlite's default
+    // capacity is 16, which a read connection can exceed across endpoints.
+    conn.set_prepared_statement_cache_capacity(64);
+    Ok(conn)
+}
+
+/// Hands out a distinct name to every test database. See the comment at the
+/// `name` binding in `open_memory` for why this is a counter and not a clock.
+#[cfg(test)]
+static TEST_DB_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Create an in-memory database for testing, with the same writer + reader
+/// pool shape as [`open`]. An anonymous `:memory:` database cannot be shared
+/// across connections, so this opens a uniquely *named* one in shared-cache
+/// mode instead, which every connection in the returned pool can reach.
+#[cfg(test)]
+pub fn open_memory() -> Result<DbPool, LificError> {
+    disable_sqlite_memstatus();
+
+    // Use a unique named in-memory DB so all connections share the same data.
+    //
+    // LIF-362: the name must be unique per pool, and a clock read is not a
+    // safe way to get that. `cache=shared` means two pools that pick the same
+    // name get the SAME database rather than two isolated ones, so a
+    // collision has one test migrating while another prepares statements
+    // against it: `DatabaseLocked` / "database schema is locked: main". This
+    // was previously seeded from `SystemTime::now().as_nanos()`, which is
+    // fine-grained enough on Linux to hide the problem and coarse enough on
+    // Windows to lose the race in CI. Shared-cache in-memory databases are
+    // scoped to the process, and every test in a binary shares one process,
+    // so a process-local counter is collision-free by construction.
+    let name = format!(
+        "file:lific_test_{}?mode=memory&cache=shared",
+        TEST_DB_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+
+    let writer = Connection::open_with_flags(
+        &name,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    writer.execute_batch("PRAGMA foreign_keys = ON;")?;
+    migrate::run(&writer)?;
+
+    let readers = ArrayQueue::new(READ_POOL_SIZE);
+    for _ in 0..READ_POOL_SIZE {
+        let conn = Connection::open_with_flags(
+            &name,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        let _ = readers.push(conn);
+    }
+
+    Ok(DbPool {
+        writer: Arc::new(Mutex::new(writer)),
+        readers: Arc::new(readers),
+        path: PathBuf::from(&name),
+        export_slots: Arc::new(Semaphore::new(2)),
+        archive_slots: Arc::new(Semaphore::new(1)),
+    })
+}
+
+/// Open (or create) the SQLite database, run migrations, and return a pool.
+pub fn open(path: &Path) -> Result<DbPool, LificError> {
+    disable_sqlite_memstatus();
+    secure_parent(path)?;
+    ensure_private_file(path)?;
+    // Writer connection — runs migrations
+    let writer = Connection::open(path)?;
+    secure_file(path)?;
+    apply_pragmas(&writer)?;
+    secure_sidecars(path)?;
+    migrate::run(&writer)?;
+    secure_sidecars(path)?;
+
+    // LIF-155: clear any actor left over from a previous process (the
+    // `_actor_state` row persists). Writes before the first request stamp
+    // must read as 'system', not as whoever acted last before restart.
+    crate::actor::stamp(
+        &writer,
+        &crate::actor::ActorCtx {
+            user_id: None,
+            transport: crate::actor::Transport::System,
+        },
+    );
+
+    // Pre-fill read pool
+    let readers = ArrayQueue::new(READ_POOL_SIZE);
+    for _ in 0..READ_POOL_SIZE {
+        let conn = open_read_connection(path)?;
+        let _ = readers.push(conn);
+    }
+
+    Ok(DbPool {
+        writer: Arc::new(Mutex::new(writer)),
+        readers: Arc::new(readers),
+        path: path.to_path_buf(),
+        export_slots: Arc::new(Semaphore::new(2)),
+        archive_slots: Arc::new(Semaphore::new(1)),
+    })
+}
+
+fn ensure_private_file(path: &Path) -> Result<(), LificError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+    }
+    match options.open(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(path)
+                .map_err(|error| LificError::Internal(format!("inspect database file: {error}")))?;
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                return Err(LificError::Internal(
+                    "database path must be a regular file, not a link".into(),
+                ));
+            }
+            #[cfg(unix)]
+            if std::os::unix::fs::MetadataExt::nlink(&metadata) != 1 {
+                return Err(LificError::Internal(
+                    "database path must not have multiple hard links".into(),
+                ));
+            }
+            Ok(())
+        }
+        Err(error) => Err(LificError::Internal(format!(
+            "create database file: {error}"
+        ))),
+    }
+}
+
+fn secure_parent(path: &Path) -> Result<(), LificError> {
+    let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    let existed = parent.exists();
+    std::fs::create_dir_all(parent)
+        .map_err(|error| LificError::Internal(format!("create database directory: {error}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = parent.symlink_metadata().map_err(|error| {
+            LificError::Internal(format!("inspect database directory: {error}"))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(LificError::Internal(
+                "database directory must not be a symlink".into(),
+            ));
+        }
+        let mode = metadata.mode() & 0o777;
+        if existed && mode & 0o022 != 0 {
+            return Err(LificError::Internal(format!(
+                "database directory {} is writable by group/others; remove group/other write permissions or choose a private data directory",
+                parent.display()
+            )));
+        }
+        if !existed {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                |error| LificError::Internal(format!("secure database directory: {error}")),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg_attr(
+    not(unix),
+    expect(clippy::unnecessary_wraps, reason = "fallible on Unix")
+)]
+fn secure_file(_path: &Path) -> Result<(), LificError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| LificError::Internal(format!("secure database file: {error}")))?;
+    }
+    Ok(())
+}
+
+fn secure_sidecars(path: &Path) -> Result<(), LificError> {
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        if sidecar.exists() {
+            secure_file(&sidecar)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{models::CreateProject, queries};
+
+    #[test]
+    fn transaction_rolls_back_when_operation_fails() {
+        let db = open_memory().expect("test db");
+
+        let result: Result<(), LificError> = db.transaction(|conn| {
+            queries::create_project(
+                conn,
+                &CreateProject {
+                    name: "Rolled back".into(),
+                    identifier: "RBK".into(),
+                    ..Default::default()
+                },
+            )?;
+            Err(LificError::BadRequest("abort transaction".into()))
+        });
+
+        assert!(matches!(result, Err(LificError::BadRequest(_))));
+        let conn = db.read().unwrap();
+        assert!(queries::list_projects(&conn).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_parent_allows_traversal_but_rejects_shared_writes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("lific.db");
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        secure_parent(&db_path).unwrap();
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(secure_parent(&db_path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_parent_rejects_symlinked_data_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        symlink(&real, &link).unwrap();
+
+        assert!(secure_parent(&link.join("lific.db")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_file_rejects_symlinks_and_hard_links() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.db");
+        ensure_private_file(&original).unwrap();
+
+        let symlinked = dir.path().join("symlinked.db");
+        symlink(&original, &symlinked).unwrap();
+        assert!(ensure_private_file(&symlinked).is_err());
+
+        let linked = dir.path().join("linked.db");
+        std::fs::hard_link(&original, &linked).unwrap();
+        assert!(ensure_private_file(&linked).is_err());
+    }
+}

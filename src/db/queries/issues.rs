@@ -1,0 +1,2464 @@
+use rusqlite::{Connection, params};
+
+use crate::db::models::*;
+use crate::error::LificError;
+
+use super::{TOMBSTONE_NOW, unescape_text};
+
+/// Read a single issue with its computed identifier, labels, and relations.
+pub fn get_issue(conn: &Connection, id: i64) -> Result<Issue, LificError> {
+    let mut issue = conn
+        .prepare_cached(
+            "SELECT i.id, i.project_id, i.sequence, p.identifier, i.title, i.description,
+                    i.status, i.priority, i.module_id, i.sort_order,
+                    i.start_date, i.target_date, i.created_at, i.updated_at, i.source, i.seq
+             FROM issues i
+             JOIN projects p ON p.id = i.project_id
+             WHERE i.id = ?1 AND i.deleted_at IS NULL",
+        )?
+        .query_row(params![id], |row| {
+            let project_ident: String = row.get(3)?;
+            let seq: i64 = row.get(2)?;
+            Ok(Issue {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                sequence: seq,
+                identifier: format!("{project_ident}-{seq}"),
+                title: row.get(4)?,
+                description: row.get(5)?,
+                status: row.get(6)?,
+                priority: row.get(7)?,
+                module_id: row.get(8)?,
+                sort_order: row.get(9)?,
+                start_date: row.get(10)?,
+                target_date: row.get(11)?,
+                created_at: row.get(12)?,
+                updated_at: row.get(13)?,
+                source: row.get(14)?,
+                seq: row.get::<_, Option<i64>>(15)?.unwrap_or(0),
+                labels: Vec::new(),
+                blocks: Vec::new(),
+                blocked_by: Vec::new(),
+                relates_to: Vec::new(),
+                duplicates: Vec::new(),
+                duplicated_by: Vec::new(),
+                waits: Vec::new(),
+                needs_human: false,
+                assignees: Vec::new(),
+            })
+        })
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                LificError::NotFound(format!("issue {id} not found"))
+            }
+            _ => e.into(),
+        })?;
+
+    let mut label_stmt = conn.prepare_cached(
+        "SELECT l.name FROM labels l
+         JOIN issue_labels il ON il.label_id = l.id
+         WHERE il.issue_id = ?1",
+    )?;
+    issue.labels = label_stmt
+        .query_map(params![id], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+
+    let mut blocks_stmt = conn.prepare_cached(
+        "SELECT p.identifier, i.sequence FROM issue_relations ir
+         JOIN issues i ON i.id = ir.target_id AND i.deleted_at IS NULL
+         JOIN projects p ON p.id = i.project_id
+         WHERE ir.source_id = ?1 AND ir.relation_type = 'blocks'",
+    )?;
+    issue.blocks = blocks_stmt
+        .query_map(params![id], |row| {
+            let proj: String = row.get(0)?;
+            let seq: i64 = row.get(1)?;
+            Ok(format!("{proj}-{seq}"))
+        })?
+        .collect::<Result<Vec<String>, _>>()?;
+
+    let mut blocked_stmt = conn.prepare_cached(
+        "SELECT p.identifier, i.sequence FROM issue_relations ir
+         JOIN issues i ON i.id = ir.source_id AND i.deleted_at IS NULL
+         JOIN projects p ON p.id = i.project_id
+         WHERE ir.target_id = ?1 AND ir.relation_type = 'blocks'",
+    )?;
+    issue.blocked_by = blocked_stmt
+        .query_map(params![id], |row| {
+            let proj: String = row.get(0)?;
+            let seq: i64 = row.get(1)?;
+            Ok(format!("{proj}-{seq}"))
+        })?
+        .collect::<Result<Vec<String>, _>>()?;
+
+    let mut relates_stmt = conn.prepare_cached(
+        "SELECT p.identifier, i.sequence FROM issue_relations ir
+         JOIN issues i ON i.id = CASE
+            WHEN ir.source_id = ?1 THEN ir.target_id
+            ELSE ir.source_id
+         END
+         JOIN projects p ON p.id = i.project_id
+         WHERE (ir.source_id = ?1 OR ir.target_id = ?1)
+           AND ir.relation_type = 'relates_to'
+           AND i.deleted_at IS NULL",
+    )?;
+    issue.relates_to = relates_stmt
+        .query_map(params![id], |row| {
+            let proj: String = row.get(0)?;
+            let seq: i64 = row.get(1)?;
+            Ok(format!("{proj}-{seq}"))
+        })?
+        .collect::<Result<Vec<String>, _>>()?;
+
+    // Duplicate is directional like `blocks`: a source→target 'duplicate' link
+    // means source duplicates target. From the source's perspective the target
+    // is what it `duplicates`; from the target's perspective the source is
+    // captured in `duplicated_by`.
+    let mut duplicates_stmt = conn.prepare_cached(
+        "SELECT p.identifier, i.sequence FROM issue_relations ir
+         JOIN issues i ON i.id = ir.target_id AND i.deleted_at IS NULL
+         JOIN projects p ON p.id = i.project_id
+         WHERE ir.source_id = ?1 AND ir.relation_type = 'duplicate'",
+    )?;
+    issue.duplicates = duplicates_stmt
+        .query_map(params![id], |row| {
+            let proj: String = row.get(0)?;
+            let seq: i64 = row.get(1)?;
+            Ok(format!("{proj}-{seq}"))
+        })?
+        .collect::<Result<Vec<String>, _>>()?;
+
+    let mut duplicated_by_stmt = conn.prepare_cached(
+        "SELECT p.identifier, i.sequence FROM issue_relations ir
+         JOIN issues i ON i.id = ir.source_id AND i.deleted_at IS NULL
+         JOIN projects p ON p.id = i.project_id
+         WHERE ir.target_id = ?1 AND ir.relation_type = 'duplicate'",
+    )?;
+    issue.duplicated_by = duplicated_by_stmt
+        .query_map(params![id], |row| {
+            let proj: String = row.get(0)?;
+            let seq: i64 = row.get(1)?;
+            Ok(format!("{proj}-{seq}"))
+        })?
+        .collect::<Result<Vec<String>, _>>()?;
+
+    issue.waits = super::waits::list_waits(conn, id)?;
+    let assignment = super::assignees::assignment(conn, id)?;
+    issue.needs_human = assignment.needs_human;
+    issue.assignees = assignment.assignees;
+
+    Ok(issue)
+}
+
+/// LIF-488: drop relation identifiers (blocks, blocked by, relates to,
+/// duplicates, duplicated by) that name an issue in a project outside
+/// `visible`, so a read never reveals that an issue exists in a project the
+/// caller cannot view. `None` keeps everything: an admin, or an instance
+/// without enforcement. A related issue that no longer resolves is dropped
+/// too. Lookups are cached per identifier, so a board of related issues costs
+/// one resolve per distinct neighbour.
+pub fn retain_visible_relations(
+    conn: &Connection,
+    issues: &mut [Issue],
+    visible: Option<&std::collections::HashSet<i64>>,
+) {
+    let Some(visible) = visible else {
+        return;
+    };
+    let mut project_of: std::collections::HashMap<String, Option<i64>> =
+        std::collections::HashMap::new();
+    for issue in issues.iter_mut() {
+        for relations in [
+            &mut issue.blocks,
+            &mut issue.blocked_by,
+            &mut issue.relates_to,
+            &mut issue.duplicates,
+            &mut issue.duplicated_by,
+        ] {
+            relations.retain(|identifier| {
+                let project = *project_of.entry(identifier.clone()).or_insert_with(|| {
+                    resolve_identifier(conn, identifier)
+                        .and_then(|id| issue_project_id(conn, id))
+                        .ok()
+                });
+                project.is_some_and(|project_id| visible.contains(&project_id))
+            });
+        }
+    }
+}
+
+pub fn issue_project_id(conn: &Connection, id: i64) -> Result<i64, LificError> {
+    conn.query_row(
+        "SELECT project_id FROM issues WHERE id = ?1 AND deleted_at IS NULL",
+        [id],
+        |row| row.get(0),
+    )
+    .map_err(|error| match error {
+        rusqlite::Error::QueryReturnedNoRows => {
+            LificError::NotFound(format!("issue {id} not found"))
+        }
+        other => other.into(),
+    })
+}
+
+/// Look up just an issue's current status by id — a lightweight read used to
+/// annotate relation lines (LIF-303) without materializing the whole Issue.
+pub fn issue_status(conn: &Connection, id: i64) -> Result<String, LificError> {
+    conn.prepare_cached("SELECT status FROM issues WHERE id = ?1 AND deleted_at IS NULL")?
+        .query_row(params![id], |row| row.get(0))
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                LificError::NotFound(format!("issue {id} not found"))
+            }
+            _ => e.into(),
+        })
+}
+
+/// Every issue-to-issue relation whose endpoints BOTH live in `project_id`,
+/// with identifiers precomputed. One round trip for the dependency-graph view
+/// (LIF-363) — the list endpoint deliberately leaves per-issue relation
+/// arrays empty, and fetching `get_issue` per node would be N+1. Cross-project
+/// edges are excluded on purpose: the graph is scoped to one project and a
+/// node for the far endpoint wouldn't exist to draw the edge against.
+pub fn list_project_relations(
+    conn: &Connection,
+    project_id: i64,
+) -> Result<Vec<ProjectRelation>, LificError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT ir.source_id, sp.identifier || '-' || s.sequence,
+                ir.target_id, tp.identifier || '-' || t.sequence,
+                ir.relation_type
+         FROM issue_relations ir
+         JOIN issues s ON s.id = ir.source_id
+         JOIN projects sp ON sp.id = s.project_id
+         JOIN issues t ON t.id = ir.target_id
+         JOIN projects tp ON tp.id = t.project_id
+         WHERE s.project_id = ?1 AND t.project_id = ?1
+           AND s.deleted_at IS NULL AND t.deleted_at IS NULL",
+    )?;
+    let rows = stmt
+        .query_map(params![project_id], |row| {
+            Ok(ProjectRelation {
+                source_id: row.get(0)?,
+                source_identifier: row.get(1)?,
+                target_id: row.get(2)?,
+                target_identifier: row.get(3)?,
+                relation_type: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Resolve "PRO-42" to an issue ID.
+pub fn resolve_identifier(conn: &Connection, identifier: &str) -> Result<i64, LificError> {
+    let parts: Vec<&str> = identifier.splitn(2, '-').collect();
+    if parts.len() != 2 {
+        return Err(LificError::BadRequest(format!(
+            "invalid issue identifier: {identifier}"
+        )));
+    }
+    let project_ident = parts[0];
+    let sequence: i64 = parts[1]
+        .parse()
+        .map_err(|_| LificError::BadRequest(format!("invalid sequence number in: {identifier}")))?;
+
+    conn.prepare_cached(
+        "SELECT i.id FROM issues i
+         JOIN projects p ON p.id = i.project_id
+         WHERE p.identifier = ?1 AND i.sequence = ?2 AND i.deleted_at IS NULL",
+    )?
+    .query_row(params![project_ident, sequence], |row| row.get(0))
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => {
+            LificError::NotFound(format!("issue {identifier} not found"))
+        }
+        _ => e.into(),
+    })
+}
+
+/// List issues with optional filters, discarding the `has_more` signal.
+pub fn list_issues(conn: &Connection, q: &ListIssuesQuery) -> Result<Vec<Issue>, LificError> {
+    Ok(list_issues_page(conn, q)?.items)
+}
+
+/// [`list_issues`] as a [`Page`](super::Page): the over-fetch that answers
+/// `has_more` happens here, under this query's own clamp, so a caller asking
+/// for exactly [`MAX_PAGE_LIMIT`](super::MAX_PAGE_LIMIT) rows still learns
+/// whether more exist (LIF-388).
+pub fn list_issues_page(
+    conn: &Connection,
+    q: &ListIssuesQuery,
+) -> Result<super::Page<Issue>, LificError> {
+    let mut sql = String::from(
+        "SELECT DISTINCT i.id, i.project_id, i.sequence, p.identifier, i.title, i.description,
+                i.status, i.priority, i.module_id, i.sort_order,
+                i.start_date, i.target_date, i.created_at, i.updated_at, i.seq
+         FROM issues i
+         JOIN projects p ON p.id = i.project_id",
+    );
+    // LIF-438: tombstones keep their row so delta sync can advertise the
+    // deletion, but every ordinary read is live-only.
+    let mut conditions: Vec<String> = vec!["i.deleted_at IS NULL".to_string()];
+    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    if let Some(pid) = q.project_id {
+        conditions.push(format!("i.project_id = ?{}", param_values.len() + 1));
+        param_values.push(Box::new(pid));
+    }
+    if let Some(project_ids) = &q.project_ids {
+        if project_ids.is_empty() {
+            conditions.push("0".to_string());
+        } else {
+            let placeholders = project_ids
+                .iter()
+                .map(|pid| {
+                    param_values.push(Box::new(*pid));
+                    format!("?{}", param_values.len())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            conditions.push(format!("i.project_id IN ({placeholders})"));
+        }
+    }
+    if let Some(status) = q.status {
+        conditions.push(format!("i.status = ?{}", param_values.len() + 1));
+        param_values.push(Box::new(status));
+    }
+    if !q.exclude_statuses.is_empty() {
+        let placeholders = q
+            .exclude_statuses
+            .iter()
+            .map(|status| {
+                param_values.push(Box::new(status.as_str()));
+                format!("?{}", param_values.len())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        conditions.push(format!("i.status NOT IN ({placeholders})"));
+    }
+    if let Some(priority) = q.priority {
+        conditions.push(format!("i.priority = ?{}", param_values.len() + 1));
+        param_values.push(Box::new(priority));
+    }
+    if let Some(mid) = q.module_id {
+        conditions.push(format!("i.module_id = ?{}", param_values.len() + 1));
+        param_values.push(Box::new(mid));
+    }
+    if let Some(ref label) = q.label {
+        sql.push_str(
+            " JOIN issue_labels il ON il.issue_id = i.id JOIN labels l ON l.id = il.label_id",
+        );
+        conditions.push(format!("l.name = ?{}", param_values.len() + 1));
+        param_values.push(Box::new(label.clone()));
+    }
+    // Date-window filters. `since` is inclusive, `until` exclusive. Stored
+    // timestamps use SQLite's "YYYY-MM-DD HH:MM:SS" form; normalize an ISO
+    // 'T' separator so "2026-06-10T12:00:00" compares correctly against it.
+    for (col, op, value) in [
+        ("i.created_at", ">=", &q.created_since),
+        ("i.created_at", "<", &q.created_until),
+        ("i.updated_at", ">=", &q.updated_since),
+        ("i.updated_at", "<", &q.updated_until),
+    ] {
+        if let Some(v) = value {
+            conditions.push(format!("{col} {op} ?{}", param_values.len() + 1));
+            param_values.push(Box::new(v.replace('T', " ")));
+        }
+    }
+    // LIF-147: assignment filter.
+    if let Some(ref value) = q.assignee {
+        let (condition, user) = super::assignees::filter_condition(
+            conn,
+            value,
+            q.caller_user_id,
+            "i",
+            param_values.len() + 1,
+        )?;
+        conditions.push(condition);
+        if let Some(user) = user {
+            param_values.push(Box::new(user));
+        }
+    }
+    // LIF-484: a user wait, or a date wait before its earliest day, blocks
+    // exactly like an open blocking issue. "Today" is the server's local day
+    // (see `waits::today`), bound as a parameter.
+    let holding_wait = if q.workable == Some(true) || q.blocked == Some(true) {
+        param_values.push(Box::new(super::waits::today_text()));
+        format!(
+            "EXISTS (SELECT 1 FROM issue_waits w WHERE w.issue_id = i.id AND {})",
+            super::waits::holding_predicate(&format!("?{}", param_values.len()))
+        )
+    } else {
+        String::new()
+    };
+    if q.workable == Some(true) {
+        conditions.push(
+            "NOT EXISTS (
+                SELECT 1 FROM issue_relations ir
+                JOIN issues blocker ON blocker.id = ir.source_id
+                WHERE ir.target_id = i.id
+                  AND ir.relation_type = 'blocks'
+                  AND blocker.status != 'done'
+                  AND blocker.deleted_at IS NULL
+            )"
+            .to_string(),
+        );
+        conditions.push(format!("NOT {holding_wait}"));
+        conditions.push("i.status NOT IN ('done', 'cancelled')".to_string());
+    }
+    if q.blocked == Some(true) {
+        conditions.push(format!(
+            "(EXISTS (
+                SELECT 1 FROM issue_relations ir
+                JOIN issues b ON b.id = ir.source_id
+                WHERE ir.target_id = i.id
+                  AND ir.relation_type = 'blocks'
+                  AND b.status != 'done'
+                  AND b.deleted_at IS NULL
+            ) OR {holding_wait})"
+        ));
+    }
+
+    if !conditions.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&conditions.join(" AND "));
+    }
+
+    // Whitelisted ORDER BY — user input selects from fixed SQL fragments,
+    // it is never interpolated directly.
+    let dir = match q.order.as_deref() {
+        None | Some("asc") => "ASC",
+        Some("desc") => "DESC",
+        Some(other) => {
+            return Err(LificError::BadRequest(format!(
+                "invalid order '{other}'. Use asc or desc."
+            )));
+        }
+    };
+    let order_clause = match q.order_by.as_deref() {
+        None if q.triage_order && q.order.is_none() => String::from(concat!(
+            "CASE i.status WHEN 'active' THEN 0 WHEN 'todo' THEN 1 WHEN 'backlog' THEN 2 ELSE 3 END, ",
+            "CASE i.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ",
+            "WHEN 'low' THEN 3 ELSE 4 END, ",
+            "i.updated_at DESC, p.identifier, i.sequence",
+        )),
+        None | Some("sort_order") => format!("i.sort_order {dir}, i.sequence {dir}"),
+        Some("sequence") => format!("i.sequence {dir}"),
+        Some("created") | Some("created_at") => format!("i.created_at {dir}, i.sequence {dir}"),
+        Some("updated") | Some("updated_at") => format!("i.updated_at {dir}, i.sequence {dir}"),
+        Some("priority") => format!(
+            "CASE i.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END {dir}, i.sequence {dir}"
+        ),
+        Some(other) => {
+            return Err(LificError::BadRequest(format!(
+                "invalid order_by '{other}'. Use sort_order, sequence, created, updated, or priority."
+            )));
+        }
+    };
+    sql.push_str(&format!(" ORDER BY {order_clause}"));
+
+    let (limit, offset) = super::page(q.limit, q.offset);
+    sql.push_str(&format!(
+        " LIMIT ?{} OFFSET ?{}",
+        param_values.len() + 1,
+        param_values.len() + 2
+    ));
+    param_values.push(Box::new(super::over_fetch(limit)));
+    param_values.push(Box::new(offset));
+
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+        param_values.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_refs.as_slice(), |row| {
+        let project_ident: String = row.get(3)?;
+        let seq: i64 = row.get(2)?;
+        Ok(Issue {
+            id: row.get(0)?,
+            project_id: row.get(1)?,
+            sequence: seq,
+            identifier: format!("{project_ident}-{seq}"),
+            title: row.get(4)?,
+            description: row.get(5)?,
+            status: row.get(6)?,
+            priority: row.get(7)?,
+            module_id: row.get(8)?,
+            sort_order: row.get(9)?,
+            start_date: row.get(10)?,
+            target_date: row.get(11)?,
+            created_at: row.get(12)?,
+            updated_at: row.get(13)?,
+            seq: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
+            // `source` is import provenance, not needed for list rendering;
+            // fetch it only on the single-issue read path (get_issue) to keep
+            // this hot list query's column set stable.
+            source: None,
+            labels: Vec::new(),
+            blocks: Vec::new(),
+            blocked_by: Vec::new(),
+            relates_to: Vec::new(),
+            duplicates: Vec::new(),
+            duplicated_by: Vec::new(),
+            waits: Vec::new(),
+            needs_human: false,
+            assignees: Vec::new(),
+        })
+    })?;
+
+    // Trim the over-fetched row before the label round-trip below, so the row
+    // that only exists to answer `has_more` never costs a label lookup.
+    let super::Page {
+        items: mut issues,
+        has_more,
+    } = super::Page::from_over_fetch(rows.collect::<Result<Vec<_>, _>>()?, limit);
+
+    if !issues.is_empty() {
+        // Map issue_id -> position so label rows attach in O(1) instead of a
+        // linear `find()` per row. The old scan was O(page x label_rows),
+        // which blows up super-linearly on large pages: a 10k-issue page went
+        // from ~82ms to ~21ms (3.9x) in benchmarking once this quadratic term
+        // was removed.
+        let pos_by_id: std::collections::HashMap<i64, usize> = issues
+            .iter()
+            .enumerate()
+            .map(|(idx, issue)| (issue.id, idx))
+            .collect();
+
+        let ids: Vec<i64> = issues.iter().map(|i| i.id).collect();
+        let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT il.issue_id, l.name FROM issue_labels il
+             JOIN labels l ON l.id = il.label_id
+             WHERE il.issue_id IN ({placeholders})"
+        );
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = ids
+            .iter()
+            .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let label_rows = stmt.query_map(params_refs.as_slice(), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in label_rows {
+            let (issue_id, label_name) = row?;
+            if let Some(&idx) = pos_by_id.get(&issue_id) {
+                issues[idx].labels.push(label_name);
+            }
+        }
+
+        // For the blocked=true filter, attach each issue's unresolved blockers
+        // so the MCP output can render `blocked_by:LIF-3,LIF-7`. Only the
+        // unresolved (non-done) blockers are surfaced, mirroring the filter.
+        if q.blocked == Some(true) {
+            let sql = format!(
+                "SELECT ir.target_id, p.identifier, b.sequence
+                 FROM issue_relations ir
+                 JOIN issues b ON b.id = ir.source_id
+                 JOIN projects p ON p.id = b.project_id
+                 WHERE ir.target_id IN ({placeholders})
+                   AND ir.relation_type = 'blocks'
+                   AND b.status != 'done'
+                   AND b.deleted_at IS NULL"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let blocker_rows = stmt.query_map(params_refs.as_slice(), |row| {
+                let target_id: i64 = row.get(0)?;
+                let proj: String = row.get(1)?;
+                let seq: i64 = row.get(2)?;
+                Ok((target_id, format!("{proj}-{seq}")))
+            })?;
+            for row in blocker_rows {
+                let (issue_id, blocker_ident) = row?;
+                if let Some(&idx) = pos_by_id.get(&issue_id) {
+                    issues[idx].blocked_by.push(blocker_ident);
+                }
+            }
+        }
+
+        // LIF-484: waits are few and always rendered, so every page carries
+        // them, in one grouped query.
+        let mut waits = super::waits::waits_by_issue(conn, &ids)?;
+        let mut assignments = super::assignees::assignments_by_issue(conn, &ids)?;
+        for issue in &mut issues {
+            issue.waits = waits.remove(&issue.id).unwrap_or_default();
+            if let Some(assignment) = assignments.remove(&issue.id) {
+                issue.needs_human = assignment.needs_human;
+                issue.assignees = assignment.assignees;
+            }
+        }
+    }
+
+    Ok(super::Page {
+        items: issues,
+        has_more,
+    })
+}
+
+/// [`count_issues_by_status`] for every project in one GROUP BY, keyed by
+/// project id (GitHub #87). A project without live issues has no entry.
+pub fn count_issues_by_status_all(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<i64, IssueStatusCounts>, LificError> {
+    let mut all: std::collections::HashMap<i64, IssueStatusCounts> =
+        std::collections::HashMap::new();
+    let mut stmt = conn.prepare_cached(
+        "SELECT project_id, status, COUNT(*) FROM issues
+         WHERE deleted_at IS NULL GROUP BY project_id, status",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (project_id, status, n) = row?;
+        all.entry(project_id).or_default().add(&status, n);
+    }
+    Ok(all)
+}
+
+/// Per-status issue counts for a project (LIF-161). One indexed GROUP BY
+/// scan — cheap even on large projects, unlike pulling every row (which the
+/// list endpoint caps anyway, so counting client-side undercounts).
+pub fn count_issues_by_status(
+    conn: &Connection,
+    project_id: i64,
+) -> Result<IssueStatusCounts, LificError> {
+    let mut counts = IssueStatusCounts::default();
+    let mut stmt = conn.prepare_cached(
+        "SELECT status, COUNT(*) FROM issues
+         WHERE project_id = ?1 AND deleted_at IS NULL GROUP BY status",
+    )?;
+    let rows = stmt.query_map(params![project_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (status, n) = row?;
+        counts.add(&status, n);
+    }
+    Ok(counts)
+}
+
+/// Reject assigning a module owned by a different project. An unknown module is
+/// deliberately left to the issue write so its existing foreign-key error is
+/// preserved.
+fn validate_module_project(
+    conn: &Connection,
+    project_id: i64,
+    module_id: i64,
+) -> Result<(), LificError> {
+    match conn.query_row(
+        "SELECT project_id FROM modules WHERE id = ?1",
+        params![module_id],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(module_project_id) if module_project_id != project_id => Err(LificError::BadRequest(
+            format!("module {module_id} does not belong to project {project_id}"),
+        )),
+        Ok(_) | Err(rusqlite::Error::QueryReturnedNoRows) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Create a new issue with auto-incremented sequence.
+pub fn create_issue(conn: &Connection, input: &CreateIssue) -> Result<Issue, LificError> {
+    if let Some(module_id) = input.module_id {
+        validate_module_project(conn, input.project_id, module_id)?;
+    }
+
+    // Deliberately counts tombstones too (LIF-438): sequence numbers are the
+    // user-visible identifier, and reusing one that a soft-deleted issue still
+    // holds would collide the moment that issue is restored.
+    let next_seq: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM issues WHERE project_id = ?1",
+            params![input.project_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(1);
+
+    // LIF-130: wrap the issue INSERT + label inserts in a savepoint so a
+    // failed label attach can't leave a half-created issue behind. The id is
+    // captured inside the closure because `last_insert_rowid()` after the
+    // label loop would reflect the last issue_labels row, not the issue.
+    //
+    // LIF-409: the hydrating read is inside the savepoint too. A `get_issue`
+    // that fails after the savepoint released would leave the row committed
+    // and report an error, which is exactly the split the savepoint exists to
+    // prevent — the caller would see a failure and the database a success.
+    let description = unescape_text(&input.description);
+    super::savepoint(conn, "create_issue", || {
+        conn.execute(
+            "INSERT INTO issues (project_id, sequence, title, description, status, priority, module_id, start_date, target_date, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                input.project_id, next_seq, input.title, description,
+                input.status, input.priority, input.module_id, input.start_date, input.target_date,
+                input.source,
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+
+        for label_name in &input.labels {
+            conn.execute(
+                "INSERT OR IGNORE INTO issue_labels (issue_id, label_id)
+                 SELECT ?1, l.id FROM labels l
+                 WHERE l.project_id = ?2 AND l.name = ?3",
+                params![id, input.project_id, label_name],
+            )?;
+        }
+        // LIF-409: attachment links are derived from the description, so they
+        // are reconciled here rather than by each transport afterwards. Inside
+        // this savepoint a failed link rolls the whole issue back, which is
+        // what "the row and its links agree" has to mean.
+        super::attachments::sync_links(
+            conn,
+            AttachmentEntity::Issue,
+            id,
+            &description,
+            input.attachments,
+            Some(input.project_id),
+        )?;
+        if let Some(ref names) = input.assignees {
+            super::assignees::set_assignment(
+                conn,
+                id,
+                input.project_id,
+                names,
+                super::assignees::actor(conn),
+            )?;
+        }
+        get_issue(conn, id)
+    })
+}
+
+pub fn update_issue(conn: &Connection, id: i64, input: &UpdateIssue) -> Result<Issue, LificError> {
+    let issue = get_issue(conn, id)?;
+
+    if let Some(Some(module_id)) = input.module_id {
+        validate_module_project(conn, issue.project_id, module_id)?;
+    }
+
+    super::savepoint::<_, Issue>(conn, "update_issue", || {
+        // LIF-441: the precondition is checked inside the savepoint, on the
+        // same connection and transaction that writes, so no one can slip a
+        // write between the check and the update. Re-read rather than reusing
+        // the copy above for the same reason.
+        if let Some(expected) = input.expected_seq {
+            let current = get_issue(conn, id)?;
+            if current.seq != expected {
+                return Err(LificError::update_conflict(
+                    &current.identifier,
+                    expected,
+                    current.seq,
+                    &current,
+                ));
+            }
+        }
+        if let Some(ref title) = input.title {
+            conn.execute(
+                "UPDATE issues SET title = ?1 WHERE id = ?2",
+                params![title, id],
+            )?;
+        }
+        if let Some(ref description) = input.description {
+            conn.execute(
+                "UPDATE issues SET description = ?1 WHERE id = ?2",
+                params![unescape_text(description), id],
+            )?;
+        }
+        if let Some(ref status) = input.status {
+            conn.execute(
+                "UPDATE issues SET status = ?1 WHERE id = ?2",
+                params![status, id],
+            )?;
+        }
+        if let Some(ref priority) = input.priority {
+            conn.execute(
+                "UPDATE issues SET priority = ?1 WHERE id = ?2",
+                params![priority, id],
+            )?;
+        }
+        // LIF-145: tristate. Outer Some means the client set the key; inner
+        // None unassigns (NULL). rusqlite binds Option<i64> to NULL when None.
+        if let Some(module_id) = input.module_id {
+            conn.execute(
+                "UPDATE issues SET module_id = ?1 WHERE id = ?2",
+                params![module_id, id],
+            )?;
+        }
+        if let Some(sort_order) = input.sort_order {
+            conn.execute(
+                "UPDATE issues SET sort_order = ?1 WHERE id = ?2",
+                params![sort_order, id],
+            )?;
+        }
+        if let Some(ref start_date) = input.start_date {
+            conn.execute(
+                "UPDATE issues SET start_date = ?1 WHERE id = ?2",
+                params![start_date, id],
+            )?;
+        }
+        if let Some(ref target_date) = input.target_date {
+            conn.execute(
+                "UPDATE issues SET target_date = ?1 WHERE id = ?2",
+                params![target_date, id],
+            )?;
+        }
+        if let Some(ref labels) = input.labels {
+            conn.execute("DELETE FROM issue_labels WHERE issue_id = ?1", params![id])?;
+            let project_id: i64 = conn.query_row(
+                "SELECT project_id FROM issues WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )?;
+            for label_name in labels {
+                conn.execute(
+                    "INSERT OR IGNORE INTO issue_labels (issue_id, label_id)
+                     SELECT ?1, l.id FROM labels l
+                     WHERE l.project_id = ?2 AND l.name = ?3",
+                    params![id, project_id, label_name],
+                )?;
+            }
+        }
+        if let Some(ref names) = input.assignees {
+            super::assignees::set_assignment(
+                conn,
+                id,
+                issue.project_id,
+                names,
+                super::assignees::actor(conn),
+            )?;
+        }
+        // LIF-409: re-scan the stored description (edited or not) and
+        // reconcile links, in the same savepoint as the edit itself. Read back
+        // from the row rather than from `input`, so an update that leaves the
+        // description alone still reconciles against what is actually stored.
+        if !matches!(input.attachments, AttachmentActor::Unattributed) {
+            let (project_id, description): (i64, String) = conn.query_row(
+                "SELECT project_id, description FROM issues WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            super::attachments::sync_links(
+                conn,
+                AttachmentEntity::Issue,
+                id,
+                &description,
+                input.attachments,
+                Some(project_id),
+            )?;
+        }
+        // LIF-409: hydrated inside the savepoint, so a failed final read rolls
+        // the whole update back rather than committing a change the caller was
+        // told had failed.
+        get_issue(conn, id)
+    })
+}
+
+/// Tombstone an issue (LIF-438).
+///
+/// The row survives with `deleted_at` set, which is what lets a delta sync
+/// advertise the deletion at a `seq` a replica can see; every read path filters
+/// it out, so from the outside this is indistinguishable from the hard delete
+/// it replaced. Migration 047's cascade trigger tombstones the issue's live
+/// comments in the same statement, stamping each with the issue's exact
+/// `deleted_at` so [`restore_issue`] can tell them apart from comments that
+/// were deleted on their own beforehand.
+pub fn delete_issue(conn: &Connection, id: i64) -> Result<(), LificError> {
+    let changed = conn.execute(
+        &format!(
+            "UPDATE issues SET deleted_at = {TOMBSTONE_NOW} \
+             WHERE id = ?1 AND deleted_at IS NULL"
+        ),
+        params![id],
+    )?;
+    if changed == 0 {
+        return Err(LificError::NotFound(format!("issue {id} not found")));
+    }
+    Ok(())
+}
+
+/// Bring a tombstoned issue back, along with the comments that went down with
+/// it (LIF-438).
+///
+/// Clearing `deleted_at` re-stamps `seq`, re-indexes the issue for search and
+/// fires migration 047's restore cascade, all in one statement.
+pub fn restore_issue(conn: &Connection, id: i64) -> Result<Issue, LificError> {
+    let changed = conn.execute(
+        "UPDATE issues SET deleted_at = NULL
+          WHERE id = ?1 AND deleted_at IS NOT NULL",
+        params![id],
+    )?;
+    if changed == 0 {
+        return Err(LificError::NotFound(format!(
+            "deleted issue {id} not found"
+        )));
+    }
+    get_issue(conn, id)
+}
+
+/// The project a tombstoned issue belongs to.
+///
+/// Restore has to authorize against the issue's project before it exists as far
+/// as [`get_issue`] is concerned, so this is the one read that deliberately
+/// looks past the tombstone filter.
+pub fn deleted_issue_project_id(conn: &Connection, id: i64) -> Result<i64, LificError> {
+    conn.query_row(
+        "SELECT project_id FROM issues WHERE id = ?1 AND deleted_at IS NOT NULL",
+        [id],
+        |row| row.get(0),
+    )
+    .map_err(|error| match error {
+        rusqlite::Error::QueryReturnedNoRows => {
+            LificError::NotFound(format!("deleted issue {id} not found"))
+        }
+        other => other.into(),
+    })
+}
+
+/// An issue's current `seq`, tombstone or not (LIF-440).
+///
+/// [`delete_issue`] tombstones the row and migration 045 stamps a fresh `seq`
+/// on it, but the caller is left holding the issue as it was *before* the
+/// delete. A realtime `issue.deleted` event has to advertise the seq of the
+/// tombstone, not of the last edit, or a resuming client would be handed a
+/// cursor that predates the deletion it just applied. Read after the write.
+pub fn issue_seq(conn: &Connection, id: i64) -> Result<i64, LificError> {
+    conn.query_row("SELECT seq FROM issues WHERE id = ?1", [id], |row| {
+        row.get(0)
+    })
+    .map_err(|error| match error {
+        rusqlite::Error::QueryReturnedNoRows => {
+            LificError::NotFound(format!("issue {id} not found"))
+        }
+        other => other.into(),
+    })
+}
+
+pub fn link_issues(
+    conn: &Connection,
+    source_id: i64,
+    target_id: i64,
+    relation_type: &str,
+) -> Result<(), LificError> {
+    if !["blocks", "relates_to", "duplicate"].contains(&relation_type) {
+        return Err(LificError::BadRequest(format!(
+            "invalid relation type: {relation_type}"
+        )));
+    }
+    // LIF-135: an issue relating to itself is never meaningful, and a
+    // self-"blocks" makes the issue permanently non-workable.
+    if source_id == target_id {
+        return Err(LificError::BadRequest(
+            "an issue cannot be linked to itself".into(),
+        ));
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO issue_relations (source_id, target_id, relation_type) VALUES (?1, ?2, ?3)",
+        params![source_id, target_id, relation_type],
+    )?;
+    Ok(())
+}
+
+/// LIF-413: swap the direction of every relation pointing from `source_id`
+/// to `target_id`, in one savepoint. The dependency graph used to reverse an
+/// edge with an unlink call followed by a link call; when the second request
+/// failed the relation was gone for good. Doing both statements here means a
+/// failure anywhere rolls back to the original edge.
+///
+/// Only the directed pair is touched: a relation that already runs
+/// `target -> source` is not a match, so reversing something that isn't there
+/// is a `NotFound` rather than a silent create. The reversed insert is
+/// `OR IGNORE` because the opposite edge may already exist for that type, in
+/// which case the reversal collapses into the existing one.
+///
+/// Returns the relation types that were reversed.
+pub fn reverse_relation(
+    conn: &Connection,
+    source_id: i64,
+    target_id: i64,
+) -> Result<Vec<String>, LificError> {
+    super::savepoint(conn, "reverse_relation", || {
+        let types: Vec<String> = conn
+            .prepare_cached(
+                "SELECT relation_type FROM issue_relations
+                 WHERE source_id = ?1 AND target_id = ?2",
+            )?
+            .query_map(params![source_id, target_id], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if types.is_empty() {
+            return Err(LificError::NotFound(format!(
+                "no relation from issue {source_id} to issue {target_id}"
+            )));
+        }
+        conn.execute(
+            "DELETE FROM issue_relations WHERE source_id = ?1 AND target_id = ?2",
+            params![source_id, target_id],
+        )?;
+        for relation_type in &types {
+            conn.execute(
+                "INSERT OR IGNORE INTO issue_relations (source_id, target_id, relation_type)
+                 VALUES (?1, ?2, ?3)",
+                params![target_id, source_id, relation_type],
+            )?;
+        }
+        Ok(types)
+    })
+}
+
+pub fn unlink_issues(conn: &Connection, source_id: i64, target_id: i64) -> Result<(), LificError> {
+    conn.execute(
+        "DELETE FROM issue_relations
+         WHERE (source_id = ?1 AND target_id = ?2)
+            OR (source_id = ?2 AND target_id = ?1)",
+        params![source_id, target_id],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+    use crate::db::queries::{projects, resources};
+
+    fn test_db() -> db::DbPool {
+        db::open_memory().expect("test db")
+    }
+
+    fn seed_project(conn: &rusqlite::Connection, ident: &str) -> i64 {
+        projects::create_project(
+            conn,
+            &CreateProject {
+                name: format!("Project {ident}"),
+                identifier: ident.into(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .id
+    }
+
+    fn seed_module(conn: &rusqlite::Connection, project_id: i64, name: &str) -> i64 {
+        resources::create_module(
+            conn,
+            &CreateModule {
+                project_id,
+                name: name.into(),
+                description: String::new(),
+                status: "active".into(),
+                emoji: None,
+            },
+        )
+        .unwrap()
+        .id
+    }
+
+    fn seed_label(conn: &rusqlite::Connection, project_id: i64, name: &str) -> i64 {
+        resources::create_label(
+            conn,
+            &CreateLabel {
+                project_id,
+                name: name.into(),
+                color: "#EF4444".into(),
+            },
+        )
+        .unwrap()
+        .id
+    }
+
+    fn quick_issue(
+        conn: &rusqlite::Connection,
+        pid: i64,
+        title: &str,
+        status: Status,
+        priority: Priority,
+    ) -> Issue {
+        create_issue(
+            conn,
+            &CreateIssue {
+                project_id: pid,
+                title: title.into(),
+                status,
+                priority,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    // LIF-388: `has_more` has to survive the page size that equals the cap.
+    // The board view asked for MAX_PAGE_LIMIT + 1 rows to detect truncation
+    // and got clamped back down to MAX_PAGE_LIMIT, so its "older issues are
+    // not shown" warning could never fire. The over-fetch now happens inside
+    // this query, after the clamp.
+    #[test]
+    fn list_issues_page_reports_has_more_at_the_page_cap() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "CAP");
+        // One issue past a full capped page, inserted directly: this test is
+        // about the LIMIT arithmetic, not about issue creation.
+        for sequence in 1..=super::super::MAX_PAGE_LIMIT + 1 {
+            conn.execute(
+                "INSERT INTO issues (project_id, sequence, title) VALUES (?1, ?2, ?3)",
+                rusqlite::params![pid, sequence, format!("Issue {sequence}")],
+            )
+            .unwrap();
+        }
+
+        let capped = list_issues_page(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                limit: Some(super::super::MAX_PAGE_LIMIT),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(capped.items.len() as i64, super::super::MAX_PAGE_LIMIT);
+        assert!(
+            capped.has_more,
+            "a capped page with an issue past it must report has_more"
+        );
+
+        // The last page has nothing past it.
+        let tail = list_issues_page(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                limit: Some(super::super::MAX_PAGE_LIMIT),
+                offset: Some(super::super::MAX_PAGE_LIMIT),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tail.items.len(), 1);
+        assert!(!tail.has_more);
+    }
+
+    // GitHub #87: a cross-project listing filters its project set in SQL, so
+    // every page is full and `has_more` is exact, and an empty set lists
+    // nothing rather than dropping the filter.
+    #[test]
+    fn list_issues_page_filters_a_project_set_before_paging() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let [first, hidden, second] = ["ONE", "HID", "TWO"].map(|ident| seed_project(&conn, ident));
+        for pid in [first, hidden, second, hidden] {
+            quick_issue(&conn, pid, "work", Status::Todo, Priority::None);
+        }
+        let page = |project_ids: Vec<i64>, offset: i64| {
+            list_issues_page(
+                &conn,
+                &ListIssuesQuery {
+                    project_ids: Some(project_ids),
+                    limit: Some(1),
+                    offset: Some(offset),
+                    order_by: Some("sequence".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+
+        let head = page(vec![first, second], 0);
+        let tail = page(vec![first, second], 1);
+        let listed: Vec<&str> = [&head, &tail]
+            .iter()
+            .flat_map(|page| page.items.iter().map(|issue| issue.identifier.as_str()))
+            .collect();
+        assert_eq!(listed, ["ONE-1", "TWO-1"]);
+        assert!(head.has_more, "a full page with a row past it has more");
+        assert!(!tail.has_more, "the last page has nothing past it");
+
+        assert!(page(Vec::new(), 0).items.is_empty());
+    }
+
+    #[test]
+    fn create_issue_auto_sequences() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let i1 = quick_issue(&conn, pid, "First", Status::Backlog, Priority::None);
+        let i2 = quick_issue(&conn, pid, "Second", Status::Backlog, Priority::None);
+        assert_eq!(i1.sequence, 1);
+        assert_eq!(i2.sequence, 2);
+        assert_eq!(i1.identifier, "TST-1");
+        assert_eq!(i2.identifier, "TST-2");
+    }
+
+    #[test]
+    fn sequences_are_per_project() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let p1 = seed_project(&conn, "AAA");
+        let p2 = seed_project(&conn, "BBB");
+        let a1 = quick_issue(&conn, p1, "A1", Status::Backlog, Priority::None);
+        let b1 = quick_issue(&conn, p2, "B1", Status::Backlog, Priority::None);
+        assert_eq!(a1.identifier, "AAA-1");
+        assert_eq!(b1.identifier, "BBB-1");
+    }
+
+    #[test]
+    fn create_issue_with_labels() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        seed_label(&conn, pid, "bug");
+        seed_label(&conn, pid, "feature");
+
+        let issue = create_issue(
+            &conn,
+            &CreateIssue {
+                project_id: pid,
+                title: "Labeled".into(),
+                labels: vec!["bug".into(), "feature".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(issue.labels.len(), 2);
+        assert!(issue.labels.contains(&"bug".to_string()));
+        assert!(issue.labels.contains(&"feature".to_string()));
+    }
+
+    #[test]
+    fn create_issue_rejects_module_from_another_project() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let issue_project_id = seed_project(&conn, "ISS");
+        let module_project_id = seed_project(&conn, "MOD");
+        let module_id = seed_module(&conn, module_project_id, "Other project");
+
+        let err = create_issue(
+            &conn,
+            &CreateIssue {
+                project_id: issue_project_id,
+                title: "Wrong module".into(),
+                module_id: Some(module_id),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            LificError::BadRequest(message)
+                if message == format!(
+                    "module {module_id} does not belong to project {issue_project_id}"
+                )
+        ));
+        assert!(
+            list_issues(
+                &conn,
+                &ListIssuesQuery {
+                    project_id: Some(issue_project_id),
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    // LIF-130: the issue INSERT and its label attaches are one atomic unit.
+    // If a label insert fails after the issue row is written, the savepoint
+    // must roll the issue back too — no half-created issues.
+    #[test]
+    fn create_issue_rolls_back_when_label_attach_fails() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        seed_label(&conn, pid, "bug");
+
+        // Force the label attach to fail after the issue INSERT succeeds.
+        // RAISE(ABORT) in a trigger propagates even through INSERT OR IGNORE.
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_label_attach BEFORE INSERT ON issue_labels
+             BEGIN SELECT RAISE(ABORT, 'label attach forced to fail'); END;",
+        )
+        .unwrap();
+
+        let result = create_issue(
+            &conn,
+            &CreateIssue {
+                project_id: pid,
+                title: "Doomed".into(),
+                labels: vec!["bug".into()],
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err(), "label attach failure must surface");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM issues WHERE project_id = ?1",
+                params![pid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "failed create must not leave a half-created issue"
+        );
+    }
+
+    #[test]
+    fn resolve_identifier_parses_correctly() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "PRO");
+        quick_issue(&conn, pid, "Resolvable", Status::Backlog, Priority::None);
+        let id = resolve_identifier(&conn, "PRO-1").unwrap();
+        let issue = get_issue(&conn, id).unwrap();
+        assert_eq!(issue.title, "Resolvable");
+    }
+
+    #[test]
+    fn resolve_identifier_rejects_garbage() {
+        let pool = test_db();
+        let conn = pool.read().unwrap();
+        assert!(resolve_identifier(&conn, "garbage").is_err());
+        assert!(resolve_identifier(&conn, "PRO-abc").is_err());
+        assert!(resolve_identifier(&conn, "").is_err());
+    }
+
+    #[test]
+    fn list_filter_by_status() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        for s in [Status::Backlog, Status::Todo, Status::Active, Status::Done] {
+            quick_issue(&conn, pid, &format!("Issue {s}"), s, Priority::None);
+        }
+        let active = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                status: Some(Status::Active),
+                priority: None,
+                module_id: None,
+                label: None,
+                workable: None,
+                limit: None,
+                offset: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].status, Status::Active);
+    }
+
+    // LIF-141: `?limit=-1` must not become SQLite's "no limit" and dump the
+    // whole table. The floor clamps a negative/zero value to 1.
+    #[test]
+    fn list_issues_clamps_negative_limit() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        for i in 0..3 {
+            quick_issue(
+                &conn,
+                pid,
+                &format!("Issue {i}"),
+                Status::Backlog,
+                Priority::None,
+            );
+        }
+        let got = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                limit: Some(-1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            got.len(),
+            1,
+            "limit=-1 must clamp to 1, not return everything"
+        );
+    }
+
+    #[test]
+    fn count_issues_by_status_tallies_each_bucket_and_total() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        // 2 backlog, 1 todo, 3 done; active/cancelled stay 0.
+        for (status, n) in [(Status::Backlog, 2), (Status::Todo, 1), (Status::Done, 3)] {
+            for i in 0..n {
+                quick_issue(&conn, pid, &format!("{status} {i}"), status, Priority::None);
+            }
+        }
+        let counts = count_issues_by_status(&conn, pid).unwrap();
+        assert_eq!(counts.backlog, 2);
+        assert_eq!(counts.todo, 1);
+        assert_eq!(counts.active, 0);
+        assert_eq!(counts.done, 3);
+        assert_eq!(counts.cancelled, 0);
+        assert_eq!(counts.total, 6);
+    }
+
+    #[test]
+    fn count_issues_by_status_scoped_to_project() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid_a = seed_project(&conn, "AAA");
+        let pid_b = seed_project(&conn, "BBB");
+        quick_issue(&conn, pid_a, "Mine", Status::Todo, Priority::None);
+        quick_issue(&conn, pid_b, "Not mine", Status::Todo, Priority::None);
+        quick_issue(&conn, pid_b, "Also not mine", Status::Done, Priority::None);
+
+        let counts = count_issues_by_status(&conn, pid_a).unwrap();
+        assert_eq!(counts.total, 1, "must not count other projects' issues");
+        assert_eq!(counts.todo, 1);
+
+        let empty = count_issues_by_status(&conn, pid_a + 999).unwrap();
+        assert_eq!(empty.total, 0, "unknown project yields all-zero counts");
+    }
+
+    #[test]
+    fn list_filter_by_priority() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        for p in [
+            Priority::Urgent,
+            Priority::High,
+            Priority::Medium,
+            Priority::Low,
+            Priority::None,
+        ] {
+            quick_issue(&conn, pid, &format!("Issue {p}"), Status::Backlog, p);
+        }
+        let urgent = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                status: None,
+                priority: Some(Priority::Urgent),
+                module_id: None,
+                label: None,
+                workable: None,
+                limit: None,
+                offset: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(urgent.len(), 1);
+        assert_eq!(urgent[0].priority, Priority::Urgent);
+    }
+
+    #[test]
+    fn list_filter_by_module() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let mid = seed_module(&conn, pid, "Core");
+        create_issue(
+            &conn,
+            &CreateIssue {
+                project_id: pid,
+                title: "In module".into(),
+                module_id: Some(mid),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        quick_issue(&conn, pid, "No module", Status::Backlog, Priority::None);
+
+        let filtered = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                status: None,
+                priority: None,
+                module_id: Some(mid),
+                label: None,
+                workable: None,
+                limit: None,
+                offset: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].title, "In module");
+    }
+
+    #[test]
+    fn list_filter_by_label() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        seed_label(&conn, pid, "bug");
+        create_issue(
+            &conn,
+            &CreateIssue {
+                project_id: pid,
+                title: "Buggy".into(),
+                labels: vec!["bug".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        quick_issue(&conn, pid, "Clean", Status::Backlog, Priority::None);
+
+        let bugs = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                status: None,
+                priority: None,
+                module_id: None,
+                label: Some("bug".into()),
+                workable: None,
+                limit: None,
+                offset: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(bugs.len(), 1);
+        assert_eq!(bugs[0].title, "Buggy");
+    }
+
+    #[test]
+    fn workable_excludes_blocked() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let blocker = quick_issue(&conn, pid, "Blocker", Status::Todo, Priority::None);
+        let blocked = quick_issue(&conn, pid, "Blocked", Status::Todo, Priority::None);
+        link_issues(&conn, blocker.id, blocked.id, "blocks").unwrap();
+
+        let workable = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                status: None,
+                priority: None,
+                module_id: None,
+                label: None,
+                workable: Some(true),
+                limit: None,
+                offset: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(workable.len(), 1);
+        assert_eq!(workable[0].title, "Blocker");
+    }
+
+    #[test]
+    fn workable_unblocks_when_blocker_done() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let blocker = quick_issue(&conn, pid, "Blocker", Status::Done, Priority::None);
+        let was_blocked = quick_issue(&conn, pid, "Was blocked", Status::Todo, Priority::None);
+        link_issues(&conn, blocker.id, was_blocked.id, "blocks").unwrap();
+
+        let workable = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                status: None,
+                priority: None,
+                module_id: None,
+                label: None,
+                workable: Some(true),
+                limit: None,
+                offset: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(workable.len(), 1);
+        assert_eq!(workable[0].title, "Was blocked");
+    }
+
+    #[test]
+    fn blocked_includes_only_blocked_issues() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let blocker = quick_issue(&conn, pid, "Blocker", Status::Todo, Priority::None);
+        let blocked = quick_issue(&conn, pid, "Blocked", Status::Todo, Priority::None);
+        link_issues(&conn, blocker.id, blocked.id, "blocks").unwrap();
+
+        let result = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                blocked: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Only the blocked issue matches; the blocker itself has no blocker.
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].title, "Blocked");
+        // Its unresolved blocker is surfaced as blocked_by.
+        assert_eq!(result[0].blocked_by, vec![blocker.identifier]);
+    }
+
+    #[test]
+    fn blocked_excludes_when_blocker_done() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let blocker = quick_issue(&conn, pid, "Blocker", Status::Done, Priority::None);
+        let was_blocked = quick_issue(&conn, pid, "Was blocked", Status::Todo, Priority::None);
+        link_issues(&conn, blocker.id, was_blocked.id, "blocks").unwrap();
+
+        let result = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                blocked: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // The only blocker is done, so nothing is blocked.
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn blocked_is_inverse_of_workable() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let blocker = quick_issue(&conn, pid, "Blocker", Status::Todo, Priority::None);
+        let blocked = quick_issue(&conn, pid, "Blocked", Status::Todo, Priority::None);
+        link_issues(&conn, blocker.id, blocked.id, "blocks").unwrap();
+
+        let workable = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                workable: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let blocked_list = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                blocked: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // The blocked issue matches blocked=true and NOT workable=true.
+        assert!(blocked_list.iter().any(|i| i.id == blocked.id));
+        assert!(!workable.iter().any(|i| i.id == blocked.id));
+    }
+
+    #[test]
+    fn workable_excludes_done_and_cancelled() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        quick_issue(&conn, pid, "Active", Status::Active, Priority::None);
+        quick_issue(&conn, pid, "Done", Status::Done, Priority::None);
+        quick_issue(&conn, pid, "Cancelled", Status::Cancelled, Priority::None);
+
+        let workable = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                status: None,
+                priority: None,
+                module_id: None,
+                label: None,
+                workable: Some(true),
+                limit: None,
+                offset: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(workable.len(), 1);
+        assert_eq!(workable[0].title, "Active");
+    }
+
+    #[test]
+    fn get_issue_includes_relations() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let i1 = quick_issue(&conn, pid, "Blocker", Status::Todo, Priority::None);
+        let i2 = quick_issue(&conn, pid, "Blocked", Status::Todo, Priority::None);
+        link_issues(&conn, i1.id, i2.id, "blocks").unwrap();
+
+        let blocker = get_issue(&conn, i1.id).unwrap();
+        let blocked = get_issue(&conn, i2.id).unwrap();
+        assert!(blocker.blocks.contains(&"TST-2".to_string()));
+        assert!(blocked.blocked_by.contains(&"TST-1".to_string()));
+    }
+
+    // LIF-303: the lightweight status lookup used to annotate relation lines.
+    #[test]
+    fn issue_status_returns_current_status() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let i = quick_issue(&conn, pid, "Some issue", Status::Active, Priority::None);
+        assert_eq!(issue_status(&conn, i.id).unwrap(), "active");
+        assert!(issue_status(&conn, 999_999).is_err());
+    }
+
+    // LIF-136: a source→target 'duplicate' link must surface on both issues —
+    // the source `duplicates` the target, the target is `duplicated_by` the
+    // source. Previously this went write-only into issue_relations.
+    #[test]
+    fn get_issue_includes_duplicate_relation_both_directions() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let dup = quick_issue(&conn, pid, "Dup", Status::Todo, Priority::None);
+        let canonical = quick_issue(&conn, pid, "Canonical", Status::Todo, Priority::None);
+        link_issues(&conn, dup.id, canonical.id, "duplicate").unwrap();
+
+        let got_dup = get_issue(&conn, dup.id).unwrap();
+        assert_eq!(got_dup.duplicates, vec!["TST-2".to_string()]);
+        assert!(got_dup.duplicated_by.is_empty());
+
+        let got_canonical = get_issue(&conn, canonical.id).unwrap();
+        assert_eq!(got_canonical.duplicated_by, vec!["TST-1".to_string()]);
+        assert!(got_canonical.duplicates.is_empty());
+    }
+
+    #[test]
+    fn get_issue_relations_preserve_cross_project_identifier() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid_a = seed_project(&conn, "AAA");
+        let pid_b = seed_project(&conn, "BBB");
+        // AAA-1 blocks BBB-1; AAA-2 relates_to BBB-1
+        let a1 = quick_issue(&conn, pid_a, "A one", Status::Todo, Priority::None);
+        let a2 = quick_issue(&conn, pid_a, "A two", Status::Todo, Priority::None);
+        let b1 = quick_issue(&conn, pid_b, "B one", Status::Todo, Priority::None);
+        link_issues(&conn, a1.id, b1.id, "blocks").unwrap();
+        link_issues(&conn, a2.id, b1.id, "relates_to").unwrap();
+
+        let got_a1 = get_issue(&conn, a1.id).unwrap();
+        assert_eq!(got_a1.blocks, vec!["BBB-1".to_string()]);
+
+        let got_b1 = get_issue(&conn, b1.id).unwrap();
+        assert_eq!(got_b1.blocked_by, vec!["AAA-1".to_string()]);
+        assert_eq!(got_b1.relates_to, vec!["AAA-2".to_string()]);
+
+        let got_a2 = get_issue(&conn, a2.id).unwrap();
+        assert_eq!(got_a2.relates_to, vec!["BBB-1".to_string()]);
+    }
+
+    #[test]
+    fn unlink_removes_relation() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let i1 = quick_issue(&conn, pid, "A", Status::Todo, Priority::None);
+        let i2 = quick_issue(&conn, pid, "B", Status::Todo, Priority::None);
+        link_issues(&conn, i1.id, i2.id, "blocks").unwrap();
+        unlink_issues(&conn, i1.id, i2.id).unwrap();
+        assert!(get_issue(&conn, i1.id).unwrap().blocks.is_empty());
+    }
+
+    #[test]
+    fn update_issue_partial_fields() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let issue = quick_issue(&conn, pid, "Original", Status::Backlog, Priority::Low);
+
+        let updated = update_issue(
+            &conn,
+            issue.id,
+            &UpdateIssue {
+                status: Some(Status::Active),
+                priority: Some(Priority::Urgent),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(updated.title, "Original");
+        assert_eq!(updated.status, Status::Active);
+        assert_eq!(updated.priority, Priority::Urgent);
+    }
+
+    #[test]
+    fn update_issue_rejects_module_from_another_project() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let issue_project_id = seed_project(&conn, "ISS");
+        let module_project_id = seed_project(&conn, "MOD");
+        let module_id = seed_module(&conn, module_project_id, "Other project");
+        let issue = quick_issue(
+            &conn,
+            issue_project_id,
+            "Wrong module",
+            Status::Backlog,
+            Priority::None,
+        );
+
+        let err = update_issue(
+            &conn,
+            issue.id,
+            &UpdateIssue {
+                module_id: Some(Some(module_id)),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            LificError::BadRequest(message)
+                if message == format!(
+                    "module {module_id} does not belong to project {issue_project_id}"
+                )
+        ));
+        assert_eq!(get_issue(&conn, issue.id).unwrap().module_id, None);
+    }
+
+    #[test]
+    fn update_issue_can_clear_its_module() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let project_id = seed_project(&conn, "TST");
+        let module_id = seed_module(&conn, project_id, "Assigned");
+        let issue = create_issue(
+            &conn,
+            &CreateIssue {
+                project_id,
+                title: "Assigned issue".into(),
+                module_id: Some(module_id),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let updated = update_issue(
+            &conn,
+            issue.id,
+            &UpdateIssue {
+                module_id: Some(None),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(updated.module_id, None);
+    }
+
+    #[test]
+    fn delete_cascades_relations() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let i1 = quick_issue(&conn, pid, "Doomed", Status::Todo, Priority::None);
+        let i2 = quick_issue(&conn, pid, "Survivor", Status::Todo, Priority::None);
+        link_issues(&conn, i1.id, i2.id, "blocks").unwrap();
+        delete_issue(&conn, i1.id).unwrap();
+        assert!(get_issue(&conn, i2.id).unwrap().blocked_by.is_empty());
+    }
+
+    // ── LIF-438: soft delete, tombstones and restore ─────────
+
+    /// Read a tombstoned issue's raw row, past the filters every shipped read
+    /// applies. Tests only: nothing in the product looks at a deleted row this
+    /// way yet, and the point of most of these assertions is that the row is
+    /// still there to look at.
+    fn raw_row(conn: &rusqlite::Connection, id: i64) -> (Option<String>, i64) {
+        conn.query_row(
+            "SELECT deleted_at, seq FROM issues WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get::<_, Option<i64>>(1)?.unwrap_or(0))),
+        )
+        .unwrap()
+    }
+
+    fn audit_actions(conn: &rusqlite::Connection, id: i64) -> Vec<String> {
+        conn.prepare(
+            "SELECT action FROM audit_log
+              WHERE entity_type = 'issue' AND entity_id = ?1 ORDER BY id",
+        )
+        .unwrap()
+        .query_map(params![id], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<String>, _>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn delete_keeps_the_row_and_advances_its_seq() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let issue = quick_issue(&conn, pid, "Doomed", Status::Todo, Priority::None);
+        let (before_deleted, before_seq) = raw_row(&conn, issue.id);
+        assert_eq!(before_deleted, None);
+
+        delete_issue(&conn, issue.id).unwrap();
+
+        let (deleted_at, seq) = raw_row(&conn, issue.id);
+        assert!(deleted_at.is_some(), "the row survives as a tombstone");
+        assert!(
+            seq > before_seq,
+            "the tombstone gets its own place in the sync stream: {seq} vs {before_seq}"
+        );
+    }
+
+    #[test]
+    fn a_deleted_issue_is_invisible_to_every_read() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let issue = quick_issue(&conn, pid, "Gone", Status::Todo, Priority::None);
+        let survivor = quick_issue(&conn, pid, "Here", Status::Todo, Priority::None);
+        delete_issue(&conn, issue.id).unwrap();
+
+        assert!(matches!(
+            get_issue(&conn, issue.id),
+            Err(LificError::NotFound(_))
+        ));
+        assert!(matches!(
+            resolve_identifier(&conn, &issue.identifier),
+            Err(LificError::NotFound(_))
+        ));
+        assert!(matches!(
+            issue_project_id(&conn, issue.id),
+            Err(LificError::NotFound(_))
+        ));
+        assert!(matches!(
+            issue_status(&conn, issue.id),
+            Err(LificError::NotFound(_))
+        ));
+
+        let listed = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, survivor.id);
+
+        // The board's per-status counts are the same read in aggregate form.
+        assert_eq!(count_issues_by_status(&conn, pid).unwrap().total, 1);
+    }
+
+    #[test]
+    fn a_deleted_issue_drops_out_of_relation_lists_and_the_graph() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let blocker = quick_issue(&conn, pid, "Blocker", Status::Todo, Priority::None);
+        let blocked = quick_issue(&conn, pid, "Blocked", Status::Todo, Priority::None);
+        link_issues(&conn, blocker.id, blocked.id, "blocks").unwrap();
+        delete_issue(&conn, blocker.id).unwrap();
+
+        assert!(get_issue(&conn, blocked.id).unwrap().blocked_by.is_empty());
+        assert!(list_project_relations(&conn, pid).unwrap().is_empty());
+
+        // ...and the blocked issue is workable again, since nothing live blocks it.
+        let workable = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                workable: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(workable.len(), 1);
+        assert_eq!(workable[0].id, blocked.id);
+    }
+
+    #[test]
+    fn deleting_twice_reports_not_found() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let issue = quick_issue(&conn, pid, "Doomed", Status::Todo, Priority::None);
+        delete_issue(&conn, issue.id).unwrap();
+        assert!(matches!(
+            delete_issue(&conn, issue.id),
+            Err(LificError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn restore_brings_the_issue_back_with_a_new_seq() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let issue = quick_issue(&conn, pid, "Back", Status::Todo, Priority::None);
+        delete_issue(&conn, issue.id).unwrap();
+        let (_, tombstone_seq) = raw_row(&conn, issue.id);
+
+        let restored = restore_issue(&conn, issue.id).unwrap();
+        assert_eq!(restored.title, "Back");
+        assert_eq!(restored.identifier, issue.identifier);
+        let (deleted_at, seq) = raw_row(&conn, issue.id);
+        assert_eq!(deleted_at, None);
+        assert!(seq > tombstone_seq, "a restore is a change like any other");
+        assert!(get_issue(&conn, issue.id).is_ok());
+    }
+
+    #[test]
+    fn restoring_something_that_was_never_deleted_is_not_found() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let issue = quick_issue(&conn, pid, "Live", Status::Todo, Priority::None);
+        assert!(matches!(
+            restore_issue(&conn, issue.id),
+            Err(LificError::NotFound(_))
+        ));
+        assert!(matches!(
+            deleted_issue_project_id(&conn, issue.id),
+            Err(LificError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn deleted_issue_project_id_reads_past_the_tombstone_filter() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let issue = quick_issue(&conn, pid, "Doomed", Status::Todo, Priority::None);
+        delete_issue(&conn, issue.id).unwrap();
+        assert_eq!(deleted_issue_project_id(&conn, issue.id).unwrap(), pid);
+    }
+
+    /// A restored issue must not collide with one created while it was in the
+    /// trash, which is why sequence allocation deliberately counts tombstones.
+    #[test]
+    fn a_tombstone_keeps_its_sequence_reserved() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let first = quick_issue(&conn, pid, "First", Status::Todo, Priority::None);
+        delete_issue(&conn, first.id).unwrap();
+
+        let second = quick_issue(&conn, pid, "Second", Status::Todo, Priority::None);
+        assert_eq!(second.identifier, "TST-2");
+
+        restore_issue(&conn, first.id).unwrap();
+        assert_eq!(resolve_identifier(&conn, "TST-1").unwrap(), first.id);
+        assert_eq!(resolve_identifier(&conn, "TST-2").unwrap(), second.id);
+    }
+
+    #[test]
+    fn delete_and_restore_each_write_exactly_one_audit_row() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let issue = quick_issue(&conn, pid, "Audited", Status::Todo, Priority::None);
+        assert_eq!(audit_actions(&conn, issue.id), vec!["create"]);
+
+        delete_issue(&conn, issue.id).unwrap();
+        assert_eq!(audit_actions(&conn, issue.id), vec!["create", "delete"]);
+
+        restore_issue(&conn, issue.id).unwrap();
+        assert_eq!(
+            audit_actions(&conn, issue.id),
+            vec!["create", "delete", "restore"]
+        );
+
+        // The tombstone row carries the same snapshot the old hard-delete row
+        // did, so a feed can still render an issue nobody can fetch.
+        let (label, old_value): (String, String) = conn
+            .query_row(
+                "SELECT entity_label, old_value FROM audit_log
+                  WHERE entity_type = 'issue' AND entity_id = ?1 AND action = 'delete'",
+                params![issue.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(label, "TST-1");
+        assert_eq!(old_value, "Audited");
+    }
+
+    // LIF-135: self-links are rejected — a self-"blocks" would make the
+    // issue permanently non-workable.
+    #[test]
+    fn link_rejects_self_link() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let issue = quick_issue(&conn, pid, "Loner", Status::Todo, Priority::None);
+
+        for rel in ["blocks", "relates_to", "duplicate"] {
+            let err = link_issues(&conn, issue.id, issue.id, rel).unwrap_err();
+            assert!(
+                matches!(err, LificError::BadRequest(_)),
+                "self-link via '{rel}' must be BadRequest, got: {err:?}"
+            );
+        }
+
+        // And the issue is still workable (no phantom self-block).
+        let got = get_issue(&conn, issue.id).unwrap();
+        assert!(got.blocks.is_empty());
+        assert!(got.blocked_by.is_empty());
+    }
+
+    #[test]
+    fn link_rejects_invalid_type() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let i1 = quick_issue(&conn, pid, "A", Status::Todo, Priority::None);
+        let i2 = quick_issue(&conn, pid, "B", Status::Todo, Priority::None);
+        assert!(link_issues(&conn, i1.id, i2.id, "invalid_type").is_err());
+    }
+
+    #[test]
+    fn list_respects_limit() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        for i in 0..10 {
+            quick_issue(
+                &conn,
+                pid,
+                &format!("Issue {i}"),
+                Status::Backlog,
+                Priority::None,
+            );
+        }
+
+        let limited = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                status: None,
+                priority: None,
+                module_id: None,
+                label: None,
+                workable: None,
+                limit: Some(3),
+                offset: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(limited.len(), 3);
+    }
+
+    /// Read an issue's raw updated_at timestamp directly from the table.
+    fn issue_updated_at(conn: &rusqlite::Connection, issue_id: i64) -> String {
+        conn.query_row(
+            "SELECT updated_at FROM issues WHERE id = ?1",
+            params![issue_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    // LIF-116: attaching a label is activity on the issue; the AFTER INSERT
+    // trigger on issue_labels (migration 017) bumps issues.updated_at.
+    // datetime('now') is 1-second resolution, so we sleep > 1s first.
+    #[test]
+    fn attaching_label_bumps_issue_updated_at() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let label_id = seed_label(&conn, pid, "bug");
+        let issue = quick_issue(&conn, pid, "Labelable", Status::Todo, Priority::None);
+
+        let before = issue_updated_at(&conn, issue.id);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        conn.execute(
+            "INSERT INTO issue_labels (issue_id, label_id) VALUES (?1, ?2)",
+            params![issue.id, label_id],
+        )
+        .unwrap();
+        let after = issue_updated_at(&conn, issue.id);
+
+        assert!(
+            after > before,
+            "expected attaching a label to bump issue updated_at: before={before}, after={after}"
+        );
+    }
+
+    // LIF-116: detaching a label is activity too; the AFTER DELETE trigger
+    // bumps updated_at using OLD.issue_id.
+    #[test]
+    fn detaching_label_bumps_issue_updated_at() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let label_id = seed_label(&conn, pid, "bug");
+        let issue = quick_issue(&conn, pid, "Labelable", Status::Todo, Priority::None);
+        conn.execute(
+            "INSERT INTO issue_labels (issue_id, label_id) VALUES (?1, ?2)",
+            params![issue.id, label_id],
+        )
+        .unwrap();
+
+        let before = issue_updated_at(&conn, issue.id);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        conn.execute(
+            "DELETE FROM issue_labels WHERE issue_id = ?1 AND label_id = ?2",
+            params![issue.id, label_id],
+        )
+        .unwrap();
+        let after = issue_updated_at(&conn, issue.id);
+
+        assert!(
+            after > before,
+            "expected detaching a label to bump issue updated_at: before={before}, after={after}"
+        );
+    }
+
+    // ── Date-window filters + sort control ───────────────────
+
+    /// Pin an issue's created_at/updated_at to explicit values so date
+    /// filter and ordering tests don't depend on wall-clock timing. The
+    /// `issues_updated` trigger rewrites updated_at to now on every UPDATE,
+    /// which would silently overwrite the pin — drop it first.
+    fn pin_timestamps(conn: &rusqlite::Connection, issue_id: i64, created: &str, updated: &str) {
+        conn.execute_batch("DROP TRIGGER IF EXISTS issues_updated;")
+            .unwrap();
+        conn.execute(
+            "UPDATE issues SET created_at = ?1, updated_at = ?2 WHERE id = ?3",
+            params![created, updated, issue_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn list_filters_by_created_window() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let old = quick_issue(&conn, pid, "Old", Status::Todo, Priority::None);
+        let new = quick_issue(&conn, pid, "New", Status::Todo, Priority::None);
+        pin_timestamps(&conn, old.id, "2026-01-05 10:00:00", "2026-01-05 10:00:00");
+        pin_timestamps(&conn, new.id, "2026-03-20 10:00:00", "2026-03-20 10:00:00");
+
+        let since = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                created_since: Some("2026-02-01".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(since.len(), 1);
+        assert_eq!(since[0].title, "New");
+
+        // `until` is exclusive: a bound equal to the row's timestamp drops it.
+        let until = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                created_until: Some("2026-03-20 10:00:00".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(until.len(), 1);
+        assert_eq!(until[0].title, "Old");
+    }
+
+    #[test]
+    fn list_filters_by_updated_window() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let stale = quick_issue(&conn, pid, "Stale", Status::Todo, Priority::None);
+        let fresh = quick_issue(&conn, pid, "Fresh", Status::Todo, Priority::None);
+        pin_timestamps(
+            &conn,
+            stale.id,
+            "2026-01-01 00:00:00",
+            "2026-01-02 00:00:00",
+        );
+        pin_timestamps(
+            &conn,
+            fresh.id,
+            "2026-01-01 00:00:00",
+            "2026-06-01 12:00:00",
+        );
+
+        let recent = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                updated_since: Some("2026-05-01".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].title, "Fresh");
+    }
+
+    // Stored timestamps use a space separator ("2026-06-01 12:00:00") while
+    // agents tend to send ISO 8601 with a 'T'. The filter must treat both
+    // identically — 'T' (0x54) sorts after ' ' (0x20), so without
+    // normalization a same-day ISO bound would skew the comparison.
+    #[test]
+    fn list_date_filter_normalizes_iso_t_separator() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let issue = quick_issue(&conn, pid, "Edge", Status::Todo, Priority::None);
+        pin_timestamps(
+            &conn,
+            issue.id,
+            "2026-06-01 12:00:00",
+            "2026-06-01 12:00:00",
+        );
+
+        let hit = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                created_since: Some("2026-06-01T12:00:00".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            hit.len(),
+            1,
+            "inclusive bound equal to row timestamp must match"
+        );
+    }
+
+    #[test]
+    fn list_orders_by_created_desc() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        let a = quick_issue(&conn, pid, "First", Status::Todo, Priority::None);
+        let b = quick_issue(&conn, pid, "Second", Status::Todo, Priority::None);
+        pin_timestamps(&conn, a.id, "2026-01-01 00:00:00", "2026-01-01 00:00:00");
+        pin_timestamps(&conn, b.id, "2026-02-01 00:00:00", "2026-02-01 00:00:00");
+
+        let issues = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                order_by: Some("created".into()),
+                order: Some("desc".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let titles: Vec<&str> = issues.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(titles, vec!["Second", "First"]);
+    }
+
+    #[test]
+    fn list_orders_by_priority_ascending() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        for priority in [
+            Priority::None,
+            Priority::Low,
+            Priority::Urgent,
+            Priority::Medium,
+            Priority::High,
+        ] {
+            quick_issue(&conn, pid, priority.as_str(), Status::Todo, priority);
+        }
+
+        let issues = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                order_by: Some("priority".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let priorities: Vec<&str> = issues.iter().map(|issue| issue.priority.as_str()).collect();
+        assert_eq!(priorities, vec!["urgent", "high", "medium", "low", "none"]);
+    }
+
+    #[test]
+    fn list_orders_by_priority_descending() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+        for priority in [
+            Priority::None,
+            Priority::Low,
+            Priority::Urgent,
+            Priority::Medium,
+            Priority::High,
+        ] {
+            quick_issue(&conn, pid, priority.as_str(), Status::Todo, priority);
+        }
+
+        let issues = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                order_by: Some("priority".into()),
+                order: Some("desc".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let priorities: Vec<&str> = issues.iter().map(|issue| issue.priority.as_str()).collect();
+        assert_eq!(priorities, vec!["none", "low", "medium", "high", "urgent"]);
+    }
+
+    #[test]
+    fn list_rejects_invalid_order_params() {
+        let pool = test_db();
+        let conn = pool.write().unwrap();
+        let pid = seed_project(&conn, "TST");
+
+        let bad_col = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                order_by: Some("priority; DROP TABLE issues".into()),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            bad_col,
+            Err(LificError::BadRequest(message))
+                if message == "invalid order_by 'priority; DROP TABLE issues'. Use sort_order, sequence, created, updated, or priority."
+        ));
+
+        let bad_dir = list_issues(
+            &conn,
+            &ListIssuesQuery {
+                project_id: Some(pid),
+                order: Some("sideways".into()),
+                ..Default::default()
+            },
+        );
+        assert!(bad_dir.is_err());
+    }
+}

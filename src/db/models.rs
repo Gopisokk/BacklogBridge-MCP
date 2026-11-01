@@ -1,0 +1,1937 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Project {
+    pub id: i64,
+    pub name: String,
+    pub identifier: String,
+    pub description: String,
+    pub emoji: Option<String>,
+    pub lead_user_id: Option<i64>,
+    /// Legacy or personal storage rank internally. Personalized REST sidebar
+    /// lists normalize this to the project's position after visibility filtering.
+    pub sort_order: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    /// Anonymous issue access. Defaults to false when reading an older server.
+    #[serde(default)]
+    pub is_public: bool,
+}
+
+/// Submitted projects precede omitted visible projects in the caller's order.
+#[derive(Debug, Deserialize)]
+pub struct ReorderProjects {
+    pub ids: Vec<i64>,
+}
+
+/// Submitted groups precede omitted groups owned by the caller.
+#[derive(Debug, Deserialize)]
+pub struct ReorderProjectGroups {
+    pub ids: Vec<i64>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct CreateProject {
+    pub name: String,
+    pub identifier: String,
+    #[serde(default)]
+    pub description: String,
+    pub emoji: Option<String>,
+    pub lead_user_id: Option<i64>,
+}
+
+/// LIF-374: `Serialize` is what the HTTP CLI backend sends as the request
+/// body, so the remote path cannot drift from the local one. `Option::is_none`
+/// skips absent fields, which keeps "field omitted" (don't change) distinct
+/// from an explicit `null` — the distinction `deserialize_nullable` reads on
+/// the tristate fields below.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct UpdateProject {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// LIF-103: tristate so clients can explicitly clear the emoji back to NULL.
+    /// None = field absent (don't change), Some(None) = set NULL, Some(Some(s)) = set string.
+    #[serde(
+        default,
+        deserialize_with = "crate::db::models::deserialize_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub emoji: Option<Option<String>>,
+    /// LIF-103: tristate so clients can explicitly clear the lead back to NULL.
+    /// None = field absent (don't change), Some(None) = set NULL, Some(Some(id)) = set id.
+    #[serde(
+        default,
+        deserialize_with = "crate::db::models::deserialize_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub lead_user_id: Option<Option<i64>>,
+    /// Absent leaves publication unchanged; only Lead or admin may set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_public: Option<bool>,
+}
+
+/// A user's named group of projects in the sidebar. `project_ids` is derived,
+/// populated by `queries::project_groups::list_groups`; it is not a column.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectGroup {
+    pub id: i64,
+    pub user_id: i64,
+    pub name: String,
+    pub sort_order: i64,
+    pub project_ids: Vec<i64>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateProjectGroup {
+    pub name: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct UpdateProjectGroup {
+    pub name: Option<String>,
+}
+
+/// `PUT /api/project-groups/assign` body. `group_id: None` takes the project
+/// out of every one of the caller's groups.
+#[derive(Debug, Deserialize)]
+pub struct AssignProjectGroup {
+    pub project_id: i64,
+    pub group_id: Option<i64>,
+}
+
+/// An issue's workflow state (LIF-385). Replaces the bare `String` that used
+/// to be validated only by the `issues.status` CHECK constraint and re-matched
+/// by hand at every call site.
+///
+/// String form matches that CHECK's values exactly
+/// ('backlog'/'todo'/'active'/'done'/'cancelled') via `FromSql`/`ToSql`, so
+/// `row.get::<_, Status>(..)` and `params![.., status]` work directly, and the
+/// serde representation is the same lowercase string the JSON API has always
+/// spoken.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    /// The default for a new issue, matching the old `default_status()`.
+    #[default]
+    Backlog,
+    Todo,
+    Active,
+    Done,
+    Cancelled,
+}
+
+impl Status {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::Backlog => "backlog",
+            Status::Todo => "todo",
+            Status::Active => "active",
+            Status::Done => "done",
+            Status::Cancelled => "cancelled",
+        }
+    }
+
+    /// Parse an optional wire string, for boundaries (MCP tool inputs, CLI
+    /// flags) that still carry `Option<String>`. `None` stays `None`.
+    pub fn parse_opt(value: Option<&str>) -> Result<Option<Self>, String> {
+        value.map(str::parse).transpose()
+    }
+
+    /// True for the two terminal states. Both `done` and `cancelled` take an
+    /// issue out of the workable set.
+    pub fn is_closed(self) -> bool {
+        matches!(self, Status::Done | Status::Cancelled)
+    }
+}
+
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Status {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "backlog" => Ok(Status::Backlog),
+            "todo" => Ok(Status::Todo),
+            "active" => Ok(Status::Active),
+            "done" => Ok(Status::Done),
+            "cancelled" => Ok(Status::Cancelled),
+            other => Err(format!(
+                "invalid status '{other}'. Use backlog, todo, active, done, or cancelled."
+            )),
+        }
+    }
+}
+
+impl rusqlite::types::FromSql for Status {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        value
+            .as_str()?
+            .parse()
+            .map_err(|_| rusqlite::types::FromSqlError::InvalidType)
+    }
+}
+
+impl rusqlite::types::ToSql for Status {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
+    }
+}
+
+/// An issue's priority (LIF-385). Same deal as [`Status`]: the wire form is the
+/// lowercase string the API has always used, and the DB form matches the
+/// `issues.priority` column.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Priority {
+    Urgent,
+    High,
+    Medium,
+    Low,
+    /// The default for a new issue, matching the old `default_priority()`.
+    #[default]
+    None,
+}
+
+impl Priority {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Priority::Urgent => "urgent",
+            Priority::High => "high",
+            Priority::Medium => "medium",
+            Priority::Low => "low",
+            Priority::None => "none",
+        }
+    }
+
+    /// See [`Status::parse_opt`].
+    pub fn parse_opt(value: Option<&str>) -> Result<Option<Self>, String> {
+        value.map(str::parse).transpose()
+    }
+}
+
+impl std::fmt::Display for Priority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Priority {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "urgent" => Ok(Priority::Urgent),
+            "high" => Ok(Priority::High),
+            "medium" => Ok(Priority::Medium),
+            "low" => Ok(Priority::Low),
+            "none" => Ok(Priority::None),
+            other => Err(format!(
+                "invalid priority '{other}'. Use urgent, high, medium, low, or none."
+            )),
+        }
+    }
+}
+
+impl rusqlite::types::FromSql for Priority {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        value
+            .as_str()?
+            .parse()
+            .map_err(|_| rusqlite::types::FromSqlError::InvalidType)
+    }
+}
+
+impl rusqlite::types::ToSql for Priority {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Issue {
+    pub id: i64,
+    pub project_id: i64,
+    pub sequence: i64,
+    /// Computed: "{project.identifier}-{sequence}"
+    pub identifier: String,
+    pub title: String,
+    pub description: String,
+    pub status: Status,
+    pub priority: Priority,
+    pub module_id: Option<i64>,
+    pub sort_order: f64,
+    pub start_date: Option<String>,
+    pub target_date: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    /// LIF-436: instance-scoped monotonic sequence. Every write to this row
+    /// (including activity on it, like a new comment) advances it past every
+    /// seq handed out so far, across issues, pages and comments alike.
+    #[serde(default)]
+    pub seq: i64,
+    /// Import provenance marker (LIF-264/265): stable per-external-issue string
+    /// like `github:owner/name#12`. `None` for hand-created issues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Labels attached to this issue (populated on read)
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Relations (populated on read for get_issue)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relates_to: Vec<String>,
+    /// Issues this one is a duplicate of (source→target 'duplicate' links where
+    /// this issue is the source).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub duplicates: Vec<String>,
+    /// Issues that are duplicates of this one (reverse direction: this issue is
+    /// the target of a 'duplicate' link).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub duplicated_by: Vec<String>,
+    /// LIF-484: user and date blockers, populated on every issue read (single
+    /// and list). Empty on the public surface.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waits: Vec<IssueWait>,
+    /// LIF-147: true when a person must do this issue, either anyone
+    /// (`assignees` empty) or the named people in `assignees`. False means
+    /// unassigned: any agent may work it. Populated on every issue read.
+    #[serde(default)]
+    pub needs_human: bool,
+    /// LIF-147: the named people, by username. Empty for unassigned issues
+    /// and for issues marked for any human.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assignees: Vec<IssueAssignee>,
+}
+
+/// LIF-147: one named assignee. Always a human account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueAssignee {
+    pub user_id: i64,
+    pub username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+/// LIF-484: what a wait is waiting on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WaitKind {
+    User,
+    Date,
+}
+
+/// LIF-484: a wait's standing on a given day. Only `Holding` blocks.
+///
+/// A user wait is always `Holding` until cleared. A date wait is `Holding`
+/// before its earliest day, `Due` from the earliest day through the latest,
+/// and `Overdue` after the latest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WaitState {
+    Holding,
+    Due,
+    Overdue,
+}
+
+/// LIF-484: a blocker that is a person or a window of days rather than an
+/// issue. `state` is computed against the server's local day at read time;
+/// a client holding the row across midnight should recompute it from
+/// `earliest`/`latest`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueWait {
+    pub id: i64,
+    pub issue_id: i64,
+    pub kind: WaitKind,
+    /// The account waited on (`kind = user`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// First day the wait stops blocking, `YYYY-MM-DD` (`kind = date`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earliest: Option<String>,
+    /// Last expected day; equal to `earliest` for a single day.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
+    #[serde(default)]
+    pub note: String,
+    pub state: WaitState,
+    pub created_at: String,
+}
+
+/// LIF-484: a new wait. Exactly one of `user` or `from` is set; `until`
+/// only accompanies `from` and defaults to it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CreateWait {
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub until: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// One edge in a project's issue-relation graph (LIF-363). Produced in bulk
+/// by `queries::list_project_relations` for the dependency-graph view, which
+/// needs every edge in one round trip instead of a `get_issue` per node. Both
+/// endpoints are guaranteed to live in the same project by that query.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectRelation {
+    pub source_id: i64,
+    /// Computed "{project.identifier}-{sequence}" for the source issue.
+    pub source_identifier: String,
+    pub target_id: i64,
+    /// Computed "{project.identifier}-{sequence}" for the target issue.
+    pub target_identifier: String,
+    /// blocks | relates_to | duplicate (directional: source→target).
+    pub relation_type: String,
+}
+
+/// `Default` is derived: `status` and `priority` fall back to
+/// [`Status::Backlog`] / [`Priority::None`], which is exactly what a JSON body
+/// omitting those fields produces (they carry `#[serde(default)]`). Before
+/// LIF-385 this needed a hand-written impl, because `String::default()` is
+/// `""` — a value the DB's CHECK constraint rejects.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct CreateIssue {
+    pub project_id: i64,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub status: Status,
+    #[serde(default)]
+    pub priority: Priority,
+    pub module_id: Option<i64>,
+    pub start_date: Option<String>,
+    pub target_date: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Import provenance marker (LIF-264/265). `None` for hand-created issues.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// LIF-147: `["human"]` marks the issue for any person; usernames name
+    /// people. `None` or empty leaves it unassigned. Transports resolve
+    /// `"me"` to a username before the query layer sees it.
+    #[serde(default)]
+    pub assignees: Option<Vec<String>>,
+    /// LIF-409: whose reach the description's attachment references inherit.
+    /// Never deserialized — a request body cannot name its own actor.
+    #[serde(skip)]
+    pub attachments: AttachmentActor,
+}
+
+/// See [`UpdateProject`] for why this serializes with `skip_serializing_if`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct UpdateIssue {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<Status>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<Priority>,
+    /// LIF-145: tristate so clients can clear an issue's module back to NULL.
+    /// None = absent (don't change), Some(None) = unassign (NULL), Some(Some(id)) = set.
+    #[serde(
+        default,
+        deserialize_with = "crate::db::models::deserialize_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub module_id: Option<Option<i64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_order: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Vec<String>>,
+    /// LIF-441: optimistic-concurrency precondition. `None` (the default, and
+    /// what every existing client sends) keeps last-writer-wins. `Some(seq)`
+    /// makes the update conditional on the row still carrying that `seq` when
+    /// the write runs; if it doesn't, the update is refused with
+    /// [`crate::error::LificError::UpdateConflict`] and nothing is written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_seq: Option<i64>,
+    /// LIF-147: replaces the whole assignment. `[]` clears it (unassigned),
+    /// `["human"]` marks it for any person, usernames name people.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignees: Option<Vec<String>>,
+    /// LIF-409: see [`CreateIssue::attachments`].
+    #[serde(skip)]
+    pub attachments: AttachmentActor,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ListIssuesQuery {
+    pub project_id: Option<i64>,
+    pub status: Option<Status>,
+    pub priority: Option<Priority>,
+    pub module_id: Option<i64>,
+    pub label: Option<String>,
+    pub workable: Option<bool>,
+    pub blocked: Option<bool>,
+    /// Inclusive lower bound on `created_at` (ISO date or datetime).
+    pub created_since: Option<String>,
+    /// Exclusive upper bound on `created_at`.
+    pub created_until: Option<String>,
+    /// Inclusive lower bound on `updated_at`.
+    pub updated_since: Option<String>,
+    /// Exclusive upper bound on `updated_at`.
+    pub updated_until: Option<String>,
+    /// Sort column: sort_order (default), sequence, created, updated, priority.
+    /// Whitelisted in `list_issues` — never interpolated raw.
+    pub order_by: Option<String>,
+    /// Sort direction: asc (default) or desc.
+    pub order: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    /// Statuses to leave out, applied in SQL before paging so excluded rows
+    /// cannot crowd eligible ones off a page. Internal: not a REST parameter.
+    #[serde(skip)]
+    pub exclude_statuses: Vec<Status>,
+    /// Only issues in these projects, applied in SQL before paging so a
+    /// cross-project page is never short (GitHub #87). `Some(vec![])` matches
+    /// nothing. Internal: not a REST parameter.
+    #[serde(skip)]
+    pub project_ids: Option<Vec<i64>>,
+    /// With no `order_by`/`order`, sort the way the web home page's "My
+    /// active issues" does: active before todo before backlog, then priority,
+    /// then most recently updated. `sort_order` is a per-project rank, so it
+    /// means nothing across projects (GitHub #87). Internal: not a REST
+    /// parameter.
+    #[serde(skip)]
+    pub triage_order: bool,
+    /// LIF-147: `none` (unassigned), `human` (any issue a person must do),
+    /// `me`, or a username.
+    pub assignee: Option<String>,
+    /// Who `assignee=me` means. Internal: set by the transport.
+    #[serde(skip)]
+    pub caller_user_id: Option<i64>,
+}
+
+/// Per-status issue counts for a project (LIF-161). `total` is the sum of
+/// all statuses so the UI never has to add them up (or worse, infer the
+/// total from a length-capped list fetch).
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct IssueStatusCounts {
+    pub backlog: i64,
+    pub todo: i64,
+    pub active: i64,
+    pub done: i64,
+    pub cancelled: i64,
+    pub total: i64,
+}
+
+impl IssueStatusCounts {
+    /// Add `n` issues stored with `status`. An unparseable value (only a
+    /// hand-edited row can hold one) still counts toward the total.
+    pub fn add(&mut self, status: &str, n: i64) {
+        if let Ok(status) = status.parse() {
+            *self.slot(status) = n;
+        }
+        self.total += n;
+    }
+
+    pub fn get(&self, status: Status) -> i64 {
+        match status {
+            Status::Backlog => self.backlog,
+            Status::Todo => self.todo,
+            Status::Active => self.active,
+            Status::Done => self.done,
+            Status::Cancelled => self.cancelled,
+        }
+    }
+
+    fn slot(&mut self, status: Status) -> &mut i64 {
+        match status {
+            Status::Backlog => &mut self.backlog,
+            Status::Todo => &mut self.todo,
+            Status::Active => &mut self.active,
+            Status::Done => &mut self.done,
+            Status::Cancelled => &mut self.cancelled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Module {
+    pub id: i64,
+    pub project_id: i64,
+    pub name: String,
+    pub description: String,
+    pub status: String,
+    /// Icon: "lucide:<Name>" or a literal emoji char. Mirrors Project.emoji.
+    pub emoji: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateModule {
+    pub project_id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "default_module_status")]
+    pub status: String,
+    pub emoji: Option<String>,
+}
+
+/// See [`UpdateProject`] for why this serializes with `skip_serializing_if`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct UpdateModule {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// LIF-124: tristate so clients can clear the icon back to NULL.
+    /// None = absent (don't change), Some(None) = NULL, Some(Some(s)) = set.
+    #[serde(
+        default,
+        deserialize_with = "crate::db::models::deserialize_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub emoji: Option<Option<String>>,
+}
+
+fn default_module_status() -> String {
+    "active".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Label {
+    pub id: i64,
+    pub project_id: i64,
+    pub name: String,
+    pub color: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateLabel {
+    pub project_id: i64,
+    pub name: String,
+    #[serde(default = "default_label_color")]
+    pub color: String,
+}
+
+/// See [`UpdateProject`] for why this serializes with `skip_serializing_if`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct UpdateLabel {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
+fn default_label_color() -> String {
+    "#6B7280".to_string()
+}
+
+/// See [`UpdateProject`] for why this serializes with `skip_serializing_if`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct UpdateFolder {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Page {
+    pub id: i64,
+    pub project_id: Option<i64>,
+    pub sequence: Option<i64>,
+    /// Computed: "{project.identifier}-DOC-{sequence}"
+    pub identifier: String,
+    pub folder_id: Option<i64>,
+    pub title: String,
+    pub content: String,
+    pub sort_order: f64,
+    /// LIF-112: lifecycle status — one of draft/active/complete/archived.
+    pub status: String,
+    /// LIF-183: user-pinned to the top of the page list.
+    #[serde(default)]
+    pub pinned: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    /// LIF-436: instance-scoped monotonic sequence, shared with issues and
+    /// comments. See [`Issue::seq`].
+    #[serde(default)]
+    pub seq: i64,
+    /// Labels attached to this page (populated on read). Empty for
+    /// workspace-level pages — labels are project-scoped (LIF-105).
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreatePage {
+    pub project_id: Option<i64>,
+    pub folder_id: Option<i64>,
+    pub title: String,
+    #[serde(default)]
+    pub content: String,
+    /// LIF-112: lifecycle status. Defaults to "draft".
+    #[serde(default = "default_page_status")]
+    pub status: String,
+    /// Label names to attach. Silently ignored for workspace pages (no
+    /// project_id), since labels are project-scoped (LIF-105).
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// LIF-409: see [`CreateIssue::attachments`].
+    #[serde(skip)]
+    pub attachments: AttachmentActor,
+}
+
+/// Hand-written for the same reason as [`CreateIssue`]'s: `status` must come
+/// from [`default_page_status`] ("draft"), not `String::default()`.
+impl Default for CreatePage {
+    fn default() -> Self {
+        Self {
+            project_id: None,
+            folder_id: None,
+            title: String::new(),
+            content: String::new(),
+            status: default_page_status(),
+            labels: Vec::new(),
+            attachments: AttachmentActor::default(),
+        }
+    }
+}
+
+/// See [`UpdateProject`] for why this serializes with `skip_serializing_if`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct UpdatePage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// None = don't change, Some(None) = set to NULL, Some(Some(id)) = set to id
+    #[serde(
+        default,
+        deserialize_with = "crate::db::models::deserialize_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub folder_id: Option<Option<i64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_order: Option<f64>,
+    /// LIF-112: lifecycle status. None = don't change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// LIF-183: pin/unpin. None = don't change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
+    /// Replace the full label set. None = don't touch, Some(vec) = replace
+    /// (delete-all + insert-by-name, mirroring `UpdateIssue`). Silently
+    /// no-ops for workspace pages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Vec<String>>,
+    /// LIF-441: optimistic-concurrency precondition, exactly as on
+    /// [`UpdateIssue`]. `None` keeps last-writer-wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_seq: Option<i64>,
+    /// LIF-409: see [`CreateIssue::attachments`].
+    #[serde(skip)]
+    pub attachments: AttachmentActor,
+}
+
+fn default_page_status() -> String {
+    "draft".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Folder {
+    pub id: i64,
+    pub project_id: i64,
+    pub parent_id: Option<i64>,
+    pub name: String,
+    pub sort_order: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateFolder {
+    pub project_id: i64,
+    pub parent_id: Option<i64>,
+    pub name: String,
+}
+
+// ── Project Members (LIF-195) ────────────────────────────────
+//
+// Per-project (user_id, role) pairs — the source of truth for project-scoped
+// authorization (epic LIF-194). This is the data model only; no enforcement
+// lives here or anywhere yet. `projects.lead_user_id` (migration 008) stays
+// as the denormalized "primary lead" pointer; the query layer keeps both
+// consistent on write (see db::queries::projects::create_project /
+// update_project).
+
+/// A project role, ordered by privilege: `Viewer < Maintainer < Lead`.
+/// Variant declaration order drives the derived `Ord`, so don't reorder
+/// these without checking `role_ordering_is_viewer_lt_maintainer_lt_lead`.
+///
+/// String form matches the DB's CHECK-constrained `role` column values
+/// exactly ('viewer' / 'maintainer' / 'lead') via `FromSql`/`ToSql`, so
+/// `row.get::<_, Role>(..)` and `params![.., role]` work directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Viewer,
+    Maintainer,
+    Lead,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Viewer => "viewer",
+            Role::Maintainer => "maintainer",
+            Role::Lead => "lead",
+        }
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Role {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "viewer" => Ok(Role::Viewer),
+            "maintainer" => Ok(Role::Maintainer),
+            "lead" => Ok(Role::Lead),
+            other => Err(format!("invalid role: {other:?}")),
+        }
+    }
+}
+
+impl rusqlite::types::FromSql for Role {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        value
+            .as_str()?
+            .parse()
+            .map_err(|_| rusqlite::types::FromSqlError::InvalidType)
+    }
+}
+
+impl rusqlite::types::ToSql for Role {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectMember {
+    pub project_id: i64,
+    pub user_id: i64,
+    pub role: Role,
+    pub created_at: String,
+}
+
+/// LIF-199: a membership row joined with the target user's display
+/// identity. Powers `GET /api/projects/{id}/members` — the web UI needs a
+/// name to render, not just a bare `user_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemberWithUser {
+    pub project_id: i64,
+    pub user_id: i64,
+    pub role: Role,
+    pub created_at: String,
+    pub username: String,
+    pub display_name: String,
+}
+
+/// `POST /api/projects/{id}/members` body. `role` defaults to `Viewer`
+/// (design LIF-DOC-7: "default grant = viewer") when omitted.
+///
+/// `role` is a raw `String`, not [`Role`]: deserializing straight into the
+/// enum would make axum's `Json<T>` extractor reject a bad value with 422
+/// before the handler ever runs, but this API contracts for 400 on an
+/// invalid role — so parsing (and the `BadRequest` it produces on failure)
+/// happens explicitly in `db::queries::members::add_member`.
+#[derive(Debug, Deserialize)]
+pub struct AddMember {
+    pub user_id: i64,
+    pub role: Option<String>,
+}
+
+/// `PATCH /api/projects/{id}/members/{user_id}` body. See [`AddMember`]'s
+/// doc comment for why `role` is a raw `String`.
+#[derive(Debug, Deserialize)]
+pub struct ChangeMemberRole {
+    pub role: String,
+}
+
+// ── Users & Sessions ─────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    pub id: i64,
+    pub username: String,
+    pub email: String,
+    #[serde(skip_serializing)]
+    pub password_hash: String,
+    pub display_name: String,
+    pub is_admin: bool,
+    pub is_bot: bool,
+    /// LIF-214: false once an admin deactivates the account. The row and
+    /// everything it authored stay put; the credentials stop working.
+    pub is_active: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateUser {
+    pub username: String,
+    pub email: String,
+    pub password: String,
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub is_admin: bool,
+    #[serde(default)]
+    pub is_bot: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LoginRequest {
+    /// Accepts either username or email
+    pub identity: String,
+    pub password: String,
+}
+
+/// Lightweight user identity extracted from auth middleware.
+/// Inserted into request extensions after token resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthUser {
+    pub id: i64,
+    pub username: String,
+    pub display_name: String,
+    pub is_admin: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommentActor {
+    pub user_id: i64,
+    pub is_admin: bool,
+}
+
+impl From<&AuthUser> for CommentActor {
+    fn from(user: &AuthUser) -> Self {
+        Self {
+            user_id: user.id,
+            is_admin: user.is_admin,
+        }
+    }
+}
+
+/// Whose reach decides which attachments a body's `/api/attachments/{id}`
+/// references are allowed to pull in (LIF-409).
+///
+/// Deliberately separate from the audit actor. Audit answers "who wrote this";
+/// this answers "whose permissions do the references inherit". Inferring one
+/// from the other is the bug this type exists to prevent: the direct-SQL CLI
+/// attributes its writes to a fallback administrator, and reading that
+/// attribution as an authorization would silently hand every CLI caller an
+/// administrator's reach over other people's unlinked uploads.
+///
+/// Carried on [`CreateIssue`] / [`UpdateIssue`] / [`CreatePage`] /
+/// [`UpdatePage`] as a `#[serde(skip)]` field so reconciliation happens inside
+/// the same savepoint as the write it derives from, and so no request body can
+/// ever name its own actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AttachmentActor {
+    /// Leave the link table alone. The default, and the right answer for every
+    /// internal write that has no editing caller behind it: imports, retention
+    /// sweeps, migrations, test fixtures.
+    #[default]
+    Unattributed,
+    /// An authenticated REST or MCP caller. A newly referenced attachment is
+    /// linked only if this actor uploaded it, is an administrator, or the
+    /// attachment is already linked somewhere in the same project.
+    Authenticated(CommentActor),
+    /// The direct-SQL CLI. Whoever runs it already holds the database file
+    /// open for writing and can insert any row by hand, so an ownership gate
+    /// protects nothing: every referenced attachment that exists is linked.
+    TrustedLocal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Session {
+    pub token: String,
+    pub user_id: i64,
+    pub expires_at: String,
+    pub created_at: String,
+}
+
+// ── Bots (tool connections) ───────────────────────────────────
+
+/// A bot (connected tool) with its owner info and key status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bot {
+    pub id: i64,
+    pub username: String,
+    pub display_name: String,
+    pub owner_id: Option<i64>,
+    pub created_at: String,
+    /// Whether the bot has any live credential (an active API key or an active
+    /// OAuth token). Used by the Connected Tools UI to show connected state,
+    /// independent of *how* the bot was connected (LIFIC-13 OAuth vs lific connect key).
+    pub connected: bool,
+    #[serde(default)]
+    pub tool_id: Option<String>,
+}
+
+// ── API Key (user-facing) ────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserApiKey {
+    pub id: i64,
+    pub name: String,
+    pub created_at: String,
+    pub expires_at: Option<String>,
+    pub revoked: bool,
+}
+
+// ── Comments ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Comment {
+    pub id: i64,
+    /// Set when the comment belongs to an issue. Mutually exclusive with `page_id`.
+    pub issue_id: Option<i64>,
+    /// Set when the comment belongs to a page. Mutually exclusive with `issue_id`.
+    pub page_id: Option<i64>,
+    pub user_id: i64,
+    /// Author username (joined from users table on read)
+    pub author: String,
+    /// Author display name (joined from users table on read)
+    pub author_display_name: String,
+    pub content: String,
+    pub created_at: String,
+    pub updated_at: String,
+    /// LIF-436: instance-scoped monotonic sequence, shared with issues and
+    /// pages. See [`Issue::seq`].
+    #[serde(default)]
+    pub seq: i64,
+    /// LIF-486: `verification` for evidence recorded by closing an issue.
+    #[serde(default)]
+    pub kind: CommentKind,
+}
+
+/// What a comment is (migration 056). The string forms match the column's
+/// CHECK constraint exactly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommentKind {
+    #[default]
+    Comment,
+    /// Completion evidence written by `update_issue` alongside a close.
+    Verification,
+}
+
+impl CommentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CommentKind::Comment => "comment",
+            CommentKind::Verification => "verification",
+        }
+    }
+}
+
+impl rusqlite::types::FromSql for CommentKind {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        match value.as_str()? {
+            "comment" => Ok(CommentKind::Comment),
+            "verification" => Ok(CommentKind::Verification),
+            _ => Err(rusqlite::types::FromSqlError::InvalidType),
+        }
+    }
+}
+
+impl rusqlite::types::ToSql for CommentKind {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateComment {
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateComment {
+    pub content: String,
+}
+
+/// LIF-263: a user who can be `@`-mentioned in a comment. Powers
+/// `GET /api/projects/{id}/mention-candidates` — the autocomplete list the
+/// composer fuzzy-filters client-side. Scoped to project members when
+/// `authz_enforced` is on, all users otherwise (see
+/// `db::queries::comments::mention_candidates`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MentionCandidate {
+    pub user_id: i64,
+    pub username: String,
+    pub display_name: String,
+}
+
+// ── Search ───────────────────────────────────────────────────
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SearchQuery {
+    pub query: String,
+    pub project_id: Option<i64>,
+    /// Restrict to one entity type: "issue" or "page".
+    pub result_type: Option<String>,
+    /// Sort mode: "relevance" (default, BM25 rank) or "recent"
+    /// (most recently updated first).
+    pub sort: Option<String>,
+    /// Match mode: "fts" (default, tokenized full-text) or "literal"
+    /// (case-insensitive substring). See `db::queries::search`.
+    pub mode: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub result_type: String,
+    pub id: i64,
+    pub identifier: Option<String>,
+    pub title: String,
+    pub snippet: String,
+    pub project_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_page_id: Option<i64>,
+    /// LIF-476: set when no result contained every query word and this hit
+    /// came from the ranked any-word fallback. Omitted from JSON when false,
+    /// so an all-words result serializes exactly as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial_match: bool,
+}
+
+// ── Audit log (LIF-155/156) ──────────────────────────────────
+
+/// One audit-log entry, joined with the actor's user row at read time.
+/// The LEFT JOIN means a deleted user degrades to None fields rather
+/// than losing history.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Activity {
+    pub id: i64,
+    pub ts: String,
+    pub actor_user_id: Option<i64>,
+    pub actor_username: Option<String>,
+    pub actor_display_name: Option<String>,
+    pub actor_is_bot: bool,
+    /// web | mcp | api | cli | system
+    pub transport: String,
+    pub entity_type: String,
+    pub entity_id: i64,
+    pub entity_label: Option<String>,
+    pub project_id: Option<i64>,
+    pub issue_id: Option<i64>,
+    pub page_id: Option<i64>,
+    /// create | update | delete | attach | detach | link | unlink
+    pub action: String,
+    pub field: Option<String>,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+}
+
+/// A page of activity plus a "there's more" hint for clients.
+#[derive(Debug, serde::Serialize)]
+pub struct ActivityFeed {
+    pub items: Vec<Activity>,
+    pub has_more: bool,
+}
+
+/// Per-actor rollup for a project's audit history (LIF-158): powers the
+/// actor rail on the Activity page and the "N actions in this project"
+/// detail when an entry is expanded.
+#[derive(Debug, serde::Serialize)]
+pub struct ActorStat {
+    pub actor_user_id: Option<i64>,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+    pub is_bot: bool,
+    /// Total audit entries by this actor in the project.
+    pub actions: i64,
+    /// Timestamp of their most recent action.
+    pub last_ts: String,
+    /// Most-used transport for this actor in this project.
+    pub top_transport: String,
+}
+
+// ── Insights (LIF-240) ────────────────────────────────────────
+//
+// Per-project analytics tab: created/closed trend lines, current
+// status/priority/module distributions, and a top-actors rollup scoped to
+// the same window as the trend lines. Everything here is read-only,
+// computed straight from `issues` + `audit_log` — no new tables.
+
+/// One point on a created/closed trend line. `week_start` is the Monday
+/// (ISO week start) the bucket covers, formatted `YYYY-MM-DD`. Buckets are
+/// dense — every week in the requested range is present with `count: 0`
+/// when there's no data, so the frontend never has to fill gaps itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct WeekPoint {
+    pub week_start: String,
+    pub count: i64,
+}
+
+/// Current per-priority issue counts for a project. Mirrors
+/// `IssueStatusCounts`'s shape (fixed fields + `total`) since priority, like
+/// status, is a closed set the API validates on write.
+#[derive(Debug, Default, Serialize)]
+pub struct PriorityCounts {
+    pub urgent: i64,
+    pub high: i64,
+    pub medium: i64,
+    pub low: i64,
+    pub none: i64,
+    pub total: i64,
+}
+
+/// Current issue count for one module (or the `module_id: None` "no
+/// module" bucket), ordered largest-first.
+#[derive(Debug, Serialize)]
+pub struct ModuleCount {
+    pub module_id: Option<i64>,
+    pub name: String,
+    pub count: i64,
+}
+
+/// `GET /api/projects/{id}/insights` response — everything the Insights
+/// tab needs in one round trip.
+#[derive(Debug, Serialize)]
+pub struct InsightsPayload {
+    /// The (clamped) week count this payload was computed over — echoed
+    /// back so the frontend's selector can confirm what it got.
+    pub weeks: i64,
+    pub created_per_week: Vec<WeekPoint>,
+    /// See `queries::insights::get_insights` doc comment for the closure
+    /// semantics: the most recent status-field transition per issue,
+    /// counted only when it landed on done/cancelled — so a reopened issue
+    /// isn't double-counted and a closed-then-reopened issue drops out.
+    pub closed_per_week: Vec<WeekPoint>,
+    pub status_counts: IssueStatusCounts,
+    pub priority_counts: PriorityCounts,
+    pub module_counts: Vec<ModuleCount>,
+    /// Actor rollup scoped to the same `weeks` window as the trend lines
+    /// (unlike `ActorStat`'s all-time project rollup on the Activity tab).
+    pub top_actors: Vec<ActorStat>,
+}
+
+// ── Delta sync (LIF-439) ─────────────────────────────────────
+//
+// The wire types for `GET /api/projects/{id}/changes` and
+// `GET /api/projects/{id}/index`. Every row here is *skinny*: identity,
+// position in the sync stream, and the fields a list or board view renders.
+// Full descriptions, page content and comment bodies are deliberately
+// absent, so a client's cold start costs one round trip proportional to the
+// row count rather than to every word ever written in the project. See
+// `db::queries::changes`.
+//
+// Issues and pages do carry a bounded `preview` — the first non-empty line
+// of the body, capped at 200 characters — because a list row renders one
+// and re-fetching every body just to draw it would defeat the point of a
+// skinny row. See [`PREVIEW_CHARS`].
+
+/// Which table a change came from. Serializes to the `kind` discriminator
+/// every change row carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChangeKind {
+    Issue,
+    Page,
+    Comment,
+}
+
+/// A live issue in the sync stream. `identifier` is the same `PRO-42` form
+/// [`Issue`] serializes, so a client never has to reassemble it from the
+/// project identifier and the per-project sequence.
+#[derive(Debug, Clone, Serialize)]
+pub struct IssueChange {
+    pub kind: ChangeKind,
+    pub seq: i64,
+    /// Always `false` — a deleted issue arrives as a [`Tombstone`] instead.
+    /// Emitted anyway so a client can branch on one field across all four
+    /// shapes rather than special-casing the absence of one.
+    pub deleted: bool,
+    pub id: i64,
+    pub identifier: String,
+    pub title: String,
+    pub status: Status,
+    pub priority: Priority,
+    pub module_id: Option<i64>,
+    pub sort_order: f64,
+    pub start_date: Option<String>,
+    pub target_date: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    /// First non-empty line of the description, capped at [`PREVIEW_CHARS`]
+    /// characters. Empty when the issue has no description. The full body
+    /// is never on this wire.
+    pub preview: String,
+    /// Label names, resolved in one grouped query per page rather than one
+    /// query per row.
+    pub labels: Vec<String>,
+    /// LIF-484: user and date blockers, one grouped query per page. Adding
+    /// or clearing one advances the issue's seq, so a replica sees it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub waits: Vec<IssueWait>,
+    /// LIF-147: see [`Issue::needs_human`].
+    pub needs_human: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub assignees: Vec<IssueAssignee>,
+}
+
+/// A live page in the sync stream. `identifier` is the `PRO-DOC-7` form
+/// [`Page`] serializes.
+#[derive(Debug, Clone, Serialize)]
+pub struct PageChange {
+    pub kind: ChangeKind,
+    pub seq: i64,
+    /// Always `false`. See [`IssueChange::deleted`].
+    pub deleted: bool,
+    pub id: i64,
+    pub identifier: String,
+    pub title: String,
+    pub status: String,
+    pub folder_id: Option<i64>,
+    pub pinned: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    /// First non-empty line of the content, capped at [`PREVIEW_CHARS`]
+    /// characters. Empty when the page has no content.
+    pub preview: String,
+    /// Label names (LIF-105, project-scoped), resolved in one grouped query
+    /// per response page.
+    pub labels: Vec<String>,
+}
+
+/// A live comment in the sync stream. The body is omitted on purpose:
+/// comments are only rendered on a detail view, which fetches them from
+/// `/api/issues/{id}/comments` anyway. What sync needs is that the comment
+/// exists, who wrote it, and when it last changed.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommentChange {
+    pub kind: ChangeKind,
+    pub seq: i64,
+    /// Always `false`. See [`IssueChange::deleted`].
+    pub deleted: bool,
+    pub id: i64,
+    /// Set when the comment belongs to an issue; mutually exclusive with
+    /// `page_id`, matching [`Comment`].
+    pub issue_id: Option<i64>,
+    pub page_id: Option<i64>,
+    pub user_id: i64,
+    pub username: String,
+    pub created_at: String,
+    pub updated_at: String,
+    /// [`Comment::kind`], renamed because `kind` is the change discriminator.
+    pub comment_kind: CommentKind,
+}
+
+/// A deleted row (migration 047). Carries identity, its place in the stream,
+/// and nothing else — every other field of a deleted row is meaningless to a
+/// replica, whose only correct response is to drop its copy.
+#[derive(Debug, Clone, Serialize)]
+pub struct Tombstone {
+    pub kind: ChangeKind,
+    pub seq: i64,
+    /// Always `true`.
+    pub deleted: bool,
+    pub id: i64,
+}
+
+/// One entry in the delta stream.
+///
+/// `untagged` because the `kind` discriminator lives on each variant's own
+/// struct: a tombstone must still report `kind: "issue"`, which an
+/// internally-tagged enum could only express by giving two variants the same
+/// tag. Each variant serializes as its inner object, so the wire shape is
+/// exactly `{"kind": ..., "seq": ..., "deleted": ..., ...}`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum Change {
+    Issue(IssueChange),
+    Page(PageChange),
+    Comment(CommentChange),
+    Tombstone(Tombstone),
+}
+
+impl Change {
+    /// Position in the sync stream, whatever the variant. Used to derive a
+    /// page's cursor and to assert ordering.
+    pub fn seq(&self) -> i64 {
+        match self {
+            Change::Issue(row) => row.seq,
+            Change::Page(row) => row.seq,
+            Change::Comment(row) => row.seq,
+            Change::Tombstone(row) => row.seq,
+        }
+    }
+}
+
+/// `GET /api/projects/{id}/changes` response.
+#[derive(Debug, Serialize)]
+pub struct ChangesPage {
+    pub changes: Vec<Change>,
+    /// The highest seq in `changes`, or the `since` the caller supplied when
+    /// the page is empty — a cursor never moves backwards.
+    pub cursor: i64,
+    pub has_more: bool,
+}
+
+/// `GET /api/projects/{id}/index` response: the cold-start snapshot.
+#[derive(Debug, Serialize)]
+pub struct IndexSnapshot {
+    /// Resume `/changes` from here. Read *before* the lists below, so a write
+    /// racing the bootstrap is re-delivered rather than skipped — see
+    /// `db::queries::changes::get_index`.
+    pub cursor: i64,
+    pub issues: Vec<IssueChange>,
+    pub pages: Vec<PageChange>,
+}
+
+// ── Plans (LIF-165/166) ──────────────────────────────────────
+//
+// A plan is a project-level tree of steps that survives across sessions.
+// Issues stay flat; the hierarchy lives here. A step optionally mirrors a
+// flat issue (plan_steps.issue_id). Storage is an adjacency list; the nested
+// `steps` tree is assembled in the query layer.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Plan {
+    pub id: i64,
+    pub project_id: i64,
+    pub sequence: i64,
+    /// Computed: "{project.identifier}-PLAN-{sequence}"
+    pub identifier: String,
+    /// Anchor issue: the issue this plan decomposes (optional).
+    pub issue_id: Option<i64>,
+    /// Computed identifier of the anchor issue, when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_identifier: Option<String>,
+    pub title: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    /// Nested step tree (populated on read for get_plan). Empty in list views.
+    #[serde(default)]
+    pub steps: Vec<PlanStepNode>,
+    /// Step counts (populated for list views and headers).
+    #[serde(default)]
+    pub step_count: i64,
+    #[serde(default)]
+    pub done_count: i64,
+}
+
+/// A node in a plan's step tree. `children` makes the adjacency-list rows
+/// nested for rendering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanStepNode {
+    pub id: i64,
+    pub plan_id: i64,
+    pub parent_step_id: Option<i64>,
+    pub position: i64,
+    pub title: String,
+    pub description: String,
+    pub issue_id: Option<i64>,
+    /// Computed identifier of the referenced issue, when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue_identifier: Option<String>,
+    /// Current status of the referenced issue (so renderers can show
+    /// "done (via LIF-42)" provenance). None when no issue is linked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue_status: Option<String>,
+    pub done: bool,
+    /// Set when an issue reopen auto-unchecked this step (LIF-167).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reopened_via_issue_at: Option<String>,
+    pub created_at: String,
+    pub edited_at: Option<String>,
+    #[serde(default)]
+    pub children: Vec<PlanStepNode>,
+}
+
+/// Create a plan, optionally anchored to an issue, with a full nested step
+/// tree authored in one call. Issue references are pre-resolved to ids by the
+/// MCP/REST layer.
+#[derive(Debug, Deserialize)]
+pub struct CreatePlan {
+    pub project_id: i64,
+    pub title: String,
+    pub issue_id: Option<i64>,
+    #[serde(default)]
+    pub steps: Vec<CreatePlanStep>,
+}
+
+/// A step in a create_plan tree. Recursive via `steps`.
+#[derive(Debug, Deserialize)]
+pub struct CreatePlanStep {
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    pub issue_id: Option<i64>,
+    #[serde(default)]
+    pub done: bool,
+    #[serde(default)]
+    pub steps: Vec<CreatePlanStep>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct UpdatePlan {
+    pub title: Option<String>,
+    pub status: Option<String>,
+    /// Tristate anchor issue: None = don't change, Some(None) = clear,
+    /// Some(Some(id)) = set.
+    #[serde(default, deserialize_with = "crate::db::models::deserialize_nullable")]
+    pub issue_id: Option<Option<i64>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ListPlansQuery {
+    pub project_id: Option<i64>,
+    pub status: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    /// Sort mode: `updated` (default) or immutable `id` for stable scans.
+    pub order_by: Option<String>,
+    /// Keyset cursor for `order_by=id` scans.
+    pub before_id: Option<i64>,
+}
+
+// ── Saved views (LIF-242) ────────────────────────────────────
+//
+// Named filter/group/sort presets per project, personal to each user (no
+// team-shared views — see api::views doc comment). `config` is an opaque
+// JSON string as far as the backend is concerned: validated for size and
+// well-formedness only (db::queries::views::validate_config), never
+// schema-validated. The frontend's `ViewConfig` (web/src/lib/issues/views.ts)
+// owns the actual shape.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedView {
+    pub id: i64,
+    pub project_id: i64,
+    pub user_id: i64,
+    pub name: String,
+    pub config: String,
+    pub is_default: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateSavedView {
+    pub name: String,
+    pub config: String,
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+/// `PATCH /api/projects/{id}/views/{view_id}` body. All fields optional —
+/// only provided ones change. Renaming, updating the config, and (un)setting
+/// the default can all be done independently or together in one call.
+#[derive(Debug, Default, Deserialize)]
+pub struct UpdateSavedView {
+    pub name: Option<String>,
+    pub config: Option<String>,
+    pub is_default: Option<bool>,
+}
+
+// ── Attachments (LIF-262) ────────────────────────────────────
+//
+// Image + file uploads on issues, comments, and pages. Bytes live on disk at
+// `<data_dir>/attachments/<sha256>` (content-addressed sidecar — see
+// migration 031 and src/storage.rs); this row is metadata only. The
+// `attachment_links` join (many-to-many) records which entities reference an
+// attachment so the orphan GC knows when a sidecar file is collectable.
+
+/// One uploaded file's metadata. Serialized straight to the upload/list
+/// responses; `sha256` is intentionally NOT serialized (it's an internal
+/// storage key, and the public handle is the numeric `id` + `/api/attachments`
+/// URL).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attachment {
+    pub id: i64,
+    #[serde(skip_serializing)]
+    pub sha256: String,
+    pub filename: String,
+    pub mime: String,
+    pub size_bytes: i64,
+    pub uploader_id: Option<i64>,
+    pub created_at: String,
+    /// LIF-418: decoded pixel dimensions for raster images (png/jpeg/gif/webp),
+    /// recorded at upload. `None` for every other type, and for rasters that
+    /// predate migration 041.
+    #[serde(default)]
+    pub width: Option<i64>,
+    #[serde(default)]
+    pub height: Option<i64>,
+    /// LIF-418: accessibility description, set through `PATCH
+    /// /api/attachments/{id}`. `None` means undescribed.
+    #[serde(default)]
+    pub alt_text: Option<String>,
+    /// LIF-418: whether `GET /api/attachments/{id}/thumbnail` will serve
+    /// something. Derived from the mime + dimensions rather than stored, and
+    /// never read back from JSON: a thumbnail exists for any raster image
+    /// whose long edge exceeds the thumbnail edge, whether or not the file has
+    /// been generated yet (the endpoint generates lazily on first request).
+    #[serde(default, skip_deserializing)]
+    pub has_thumbnail: bool,
+}
+
+/// The kind of entity an attachment is linked to. Mirrors the
+/// `attachment_links.entity_type` CHECK values exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AttachmentEntity {
+    Issue,
+    Page,
+    Comment,
+}
+
+impl AttachmentEntity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AttachmentEntity::Issue => "issue",
+            AttachmentEntity::Page => "page",
+            AttachmentEntity::Comment => "comment",
+        }
+    }
+}
+
+impl std::str::FromStr for AttachmentEntity {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "issue" => Ok(AttachmentEntity::Issue),
+            "page" => Ok(AttachmentEntity::Page),
+            "comment" => Ok(AttachmentEntity::Comment),
+            other => Err(format!("invalid attachment entity: {other:?}")),
+        }
+    }
+}
+
+// ── Project files manager (LIF-418) ──────────────────────────
+//
+// The per-project "Files" view reads every attachment linked to any entity in
+// one project, plus the uploads by that project's members that are sitting
+// unlinked and waiting for the orphan sweeper. Both shapes are read-only
+// projections assembled by `db::queries::attachments`, never stored.
+
+/// One entity that references an attachment, resolved far enough for the UI to
+/// render a chip and navigate to it. `identifier` is `None` only for a
+/// workspace-level page (no project, hence no `PRJ-DOC-n` form).
+#[derive(Debug, Clone, Serialize)]
+pub struct LinkedEntity {
+    /// issue | page | comment
+    pub entity_type: String,
+    /// The linked row's id. For a comment this is the comment id; the
+    /// identifier and title describe the comment's parent, which is where a
+    /// click should land.
+    pub entity_id: i64,
+    pub identifier: Option<String>,
+    pub title: String,
+    /// The page this link lands on, when it lands on one (a page link, or a
+    /// comment on a page). Pages are routed by numeric id in the web UI, so
+    /// the identifier alone is not enough to build the link.
+    pub page_id: Option<i64>,
+}
+
+/// One row of the project files listing.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectAttachment {
+    pub id: i64,
+    pub filename: String,
+    pub mime: String,
+    /// Coarse bucket the UI filters and iconifies by: image | video | audio |
+    /// text | pdf | archive | other. Computed server-side so the filter chips
+    /// and the row icons can never disagree with what the filter matched.
+    pub mime_class: String,
+    pub size_bytes: i64,
+    pub uploader_id: Option<i64>,
+    /// Username of the uploader, or `None` when the account is gone (the FK is
+    /// `ON DELETE SET NULL`).
+    pub uploader: Option<String>,
+    pub uploader_display_name: Option<String>,
+    pub created_at: String,
+    /// The entities *in this project* that reference the file. Deliberately
+    /// project-scoped: an attachment can also be linked from a project the
+    /// caller cannot see, and listing those titles here would leak them.
+    pub entities: Vec<LinkedEntity>,
+}
+
+/// `GET /api/projects/{id}/attachments` envelope: one page of rows plus the
+/// aggregate header (count + bytes) for the *whole* filtered set, not just the
+/// page.
+#[derive(Debug, Serialize)]
+pub struct ProjectAttachmentPage {
+    pub items: Vec<ProjectAttachment>,
+    pub has_more: bool,
+    pub total_count: i64,
+    pub total_bytes: i64,
+}
+
+/// Query parameters for the project files listing.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProjectAttachmentQuery {
+    /// image | video | audio | text | pdf | archive | other
+    pub mime_class: Option<String>,
+    /// Uploader username (case-insensitive exact match).
+    pub uploader: Option<String>,
+    /// Restrict to attachments linked via this kind of entity: issue | page |
+    /// comment.
+    pub entity_type: Option<String>,
+    /// created_at (default) | size | filename
+    pub sort: Option<String>,
+    /// asc | desc. Defaults to desc for created_at/size and asc for filename.
+    pub order: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// One unlinked upload awaiting the orphan sweeper, as shown in the Files
+/// view's "Pending cleanup" section.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingOrphan {
+    pub id: i64,
+    pub filename: String,
+    pub mime: String,
+    pub size_bytes: i64,
+    pub uploader_id: Option<i64>,
+    pub uploader: Option<String>,
+    pub uploaded_at: String,
+    /// Seconds since the upload.
+    pub age_seconds: i64,
+    /// Seconds left before the sweeper may collect it. `0` means it is already
+    /// past the grace window and goes on the next sweep.
+    pub seconds_until_sweep: i64,
+}
+
+/// `GET /api/projects/{id}/attachments/orphans` envelope.
+#[derive(Debug, Serialize)]
+pub struct PendingOrphanList {
+    pub items: Vec<PendingOrphan>,
+    /// The grace window the server applies, so the UI can explain the
+    /// countdown without hardcoding 24h.
+    pub grace_seconds: i64,
+    pub total_bytes: i64,
+}
+
+/// LIF-448: a repository bound to a project. The aliases that resolve to it
+/// live in [`RepoIdentity`]; this row carries only the target and its
+/// provenance. `created_by` records who made the binding and confers no
+/// control over it (migration 049).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoBinding {
+    pub id: i64,
+    pub project_id: i64,
+    pub created_at: String,
+    pub created_by: Option<i64>,
+}
+
+/// LIF-448: one alias that resolves to a [`RepoBinding`]. `kind` is `remote`
+/// (a normalized remote URL) or `root` (an absolute worktree root path), and
+/// `(kind, value)` is unique across the whole instance: an alias names one
+/// repository, so it can belong to only one binding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoIdentity {
+    pub id: i64,
+    pub binding_id: i64,
+    pub kind: String,
+    pub value: String,
+    pub first_seen_at: String,
+}
+
+/// Deserializes a JSON field as Option<Option<T>>:
+/// - absent key → None (don't change)
+/// - "field": null → Some(None) (set to null)
+/// - "field": value → Some(Some(value))
+pub fn deserialize_nullable<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::deserialize(deserializer)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::types::{FromSql, ToSql, ValueRef};
+
+    const STATUSES: [Status; 5] = [
+        Status::Backlog,
+        Status::Todo,
+        Status::Active,
+        Status::Done,
+        Status::Cancelled,
+    ];
+
+    const PRIORITIES: [Priority; 5] = [
+        Priority::Urgent,
+        Priority::High,
+        Priority::Medium,
+        Priority::Low,
+        Priority::None,
+    ];
+
+    /// The JSON wire format is the lowercase string it has always been, so
+    /// existing clients (web UI, MCP hosts, the HTTP CLI backend) can't tell
+    /// the enum from the old `String`.
+    #[test]
+    fn status_serde_round_trips_as_the_lowercase_wire_string() {
+        for status in STATUSES {
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, format!("\"{}\"", status.as_str()));
+            assert_eq!(serde_json::from_str::<Status>(&json).unwrap(), status);
+            assert_eq!(status.to_string(), status.as_str());
+            assert_eq!(status.as_str().parse::<Status>().unwrap(), status);
+        }
+    }
+
+    #[test]
+    fn priority_serde_round_trips_as_the_lowercase_wire_string() {
+        for priority in PRIORITIES {
+            let json = serde_json::to_string(&priority).unwrap();
+            assert_eq!(json, format!("\"{}\"", priority.as_str()));
+            assert_eq!(serde_json::from_str::<Priority>(&json).unwrap(), priority);
+            assert_eq!(priority.to_string(), priority.as_str());
+            assert_eq!(priority.as_str().parse::<Priority>().unwrap(), priority);
+        }
+    }
+
+    /// `ToSql`/`FromSql` must agree with the `issues` CHECK constraint values,
+    /// so a stored enum reads back as the same variant.
+    #[test]
+    fn status_and_priority_round_trip_through_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (
+                 status TEXT NOT NULL
+                     CHECK(status IN ('backlog','todo','active','done','cancelled')),
+                 priority TEXT NOT NULL
+                     CHECK(priority IN ('urgent','high','medium','low','none'))
+             )",
+        )
+        .unwrap();
+
+        for status in STATUSES {
+            for priority in PRIORITIES {
+                conn.execute(
+                    "INSERT INTO t (status, priority) VALUES (?1, ?2)",
+                    rusqlite::params![status, priority],
+                )
+                .unwrap();
+                let (got_status, got_priority) = conn
+                    .query_row("SELECT status, priority FROM t", [], |row| {
+                        Ok((row.get::<_, Status>(0)?, row.get::<_, Priority>(1)?))
+                    })
+                    .unwrap();
+                assert_eq!(got_status, status);
+                assert_eq!(got_priority, priority);
+                conn.execute("DELETE FROM t", []).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_column_values_fail_to_convert_rather_than_defaulting() {
+        assert!(Status::column_result(ValueRef::Text(b"shipped")).is_err());
+        assert!(Priority::column_result(ValueRef::Text(b"critical")).is_err());
+        assert_eq!(
+            Status::Done.to_sql().unwrap(),
+            rusqlite::types::ToSqlOutput::from("done")
+        );
+        assert_eq!(
+            Priority::Low.to_sql().unwrap(),
+            rusqlite::types::ToSqlOutput::from("low")
+        );
+    }
+
+    #[test]
+    fn parsing_an_unknown_value_names_the_valid_ones() {
+        assert_eq!(
+            "shipped".parse::<Status>().unwrap_err(),
+            "invalid status 'shipped'. Use backlog, todo, active, done, or cancelled."
+        );
+        assert_eq!(
+            "critical".parse::<Priority>().unwrap_err(),
+            "invalid priority 'critical'. Use urgent, high, medium, low, or none."
+        );
+        // Case matters: the wire format is lowercase.
+        assert!("Done".parse::<Status>().is_err());
+    }
+
+    #[test]
+    fn parse_opt_passes_absent_values_through() {
+        assert_eq!(Status::parse_opt(None).unwrap(), None);
+        assert_eq!(
+            Status::parse_opt(Some("active")).unwrap(),
+            Some(Status::Active)
+        );
+        assert!(Status::parse_opt(Some("nope")).is_err());
+        assert_eq!(Priority::parse_opt(None).unwrap(), None);
+        assert_eq!(
+            Priority::parse_opt(Some("low")).unwrap(),
+            Some(Priority::Low)
+        );
+        assert!(Priority::parse_opt(Some("nope")).is_err());
+    }
+
+    /// The old `default_status()` / `default_priority()` serde defaults, now
+    /// carried by the enums themselves.
+    #[test]
+    fn omitted_status_and_priority_default_to_backlog_and_none() {
+        assert_eq!(Status::default(), Status::Backlog);
+        assert_eq!(Priority::default(), Priority::None);
+
+        let created: CreateIssue =
+            serde_json::from_str(r#"{"project_id": 1, "title": "New"}"#).unwrap();
+        assert_eq!(created.status, Status::Backlog);
+        assert_eq!(created.priority, Priority::None);
+
+        let defaulted = CreateIssue::default();
+        assert_eq!(defaulted.status, Status::Backlog);
+        assert_eq!(defaulted.priority, Priority::None);
+    }
+
+    #[test]
+    fn only_done_and_cancelled_count_as_closed() {
+        assert!(Status::Done.is_closed());
+        assert!(Status::Cancelled.is_closed());
+        assert!(!Status::Backlog.is_closed());
+        assert!(!Status::Todo.is_closed());
+        assert!(!Status::Active.is_closed());
+    }
+}
