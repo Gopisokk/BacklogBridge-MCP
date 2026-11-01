@@ -19,10 +19,10 @@
   let scrollContainer = $state<HTMLElement | null>(null);
   let scrollTop = $state(0);
 
-  // Sentinel value for the Lific logo, smuggled into the emoji grid as if
+  // Sentinel value for the Merge logo, smuggled into the emoji grid as if
   // it were just another emoji. Renderers special-case it to draw the
   // actual logo image. Not a real unicode char — purely a stored marker.
-  const LIFIC_LOGO = "lific:logo";
+  const LIFIC_LOGO = "merge:logo";
 
   // ── Emoji data from unicode-emoji-json ─────────────
   // Pre-process into a flat searchable list, excluding skin tone variants and flags
@@ -37,9 +37,9 @@
     "Travel & Places", "Activities", "Food & Drink",
     "People & Body", "Symbols",
   ];
-  // Logo rides at the very front (searchable by "lific" / "logo").
+  // Logo rides at the very front (searchable by "merge" / "logo").
   const sortedEmojis: EmojiEntry[] = [
-    { emoji: LIFIC_LOGO, name: "lific logo", group: "Lific" },
+    { emoji: LIFIC_LOGO, name: "merge logo", group: "Merge" },
     ...ALL_EMOJIS.sort((a, b) => {
       const ai = GROUP_ORDER.indexOf(a.group);
       const bi = GROUP_ORDER.indexOf(b.group);
@@ -330,7 +330,7 @@
 
 {#snippet emojiCell(emoji: string)}
   {#if emoji === LIFIC_LOGO}
-    <img src="/logo.webp" alt="Lific" width="20" height="20" class="object-contain" />
+    <img src="/logo.webp" alt="Merge" width="20" height="20" class="object-contain" />
   {:else}
     {emoji}
   {/if}

@@ -15,10 +15,10 @@
   let icon = $derived(projectIcon(value));
 </script>
 
-{#if icon === "lific:logo"}
+{#if icon === "merge:logo"}
   <img
     src="/logo.webp"
-    alt="Lific"
+    alt="Merge"
     class="{className} object-contain inline-block"
     style="width: {size}px; height: {size}px;"
   />

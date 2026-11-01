@@ -171,7 +171,7 @@
   // current one.
   let exportLine = $derived.by(() => {
     if (!connectTool?.usesEnvKey || !connectKey) return "";
-    const v = connectTool.envVar ?? "LIFIC_API_KEY";
+    const v = connectTool.envVar ?? "MERGE_API_KEY";
     return selectedOs === "windows"
       ? `setx ${v} "${connectKey}"`
       : `export ${v}="${connectKey}"`;
@@ -725,7 +725,7 @@
           <h2 class="text-[1rem] font-semibold text-[var(--text)]">Connected tools</h2>
         </div>
         <p class="text-body text-[var(--text-muted)] mb-5 leading-relaxed">
-          Link an AI coding tool to Lific over MCP. Each connection mints a bot identity that acts on your behalf; disconnect any time.
+          Link an AI coding tool to Merge over MCP. Each connection mints a bot identity that acts on your behalf; disconnect any time.
         </p>
 
         <div class="grid sm:grid-cols-2 gap-2.5">
@@ -884,7 +884,7 @@
           <p class="text-caption text-[var(--text-muted)] mt-2.5 max-w-[480px] leading-relaxed">
             Changing your password signs you out on every other device and revokes this account's
             API keys, OAuth sessions and connected tools. You stay signed in here. Every tool you
-            use with Lific has to be reconnected afterwards.
+            use with Merge has to be reconnected afterwards.
           </p>
           {#if pwError}
             <p class="text-caption text-[var(--error)] mt-2 flex items-center gap-1" role="alert"><AlertTriangle size={12} /> {pwError}</p>
@@ -943,7 +943,7 @@
             >
               <p class="text-caption text-[var(--text)] leading-relaxed">
                 This signs out every device, including this one, and revokes this account's API
-                keys, OAuth sessions and connected tools. Every tool you use with Lific has to be
+                keys, OAuth sessions and connected tools. Every tool you use with Merge has to be
                 reconnected afterwards. This cannot be undone.
               </p>
               {#if signOutAllError}

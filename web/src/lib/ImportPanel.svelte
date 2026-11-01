@@ -1,5 +1,5 @@
 <script lang="ts">
-  // LIF-264: GitHub Issues → Lific import panel.
+  // LIF-264: GitHub Issues → Merge import panel.
   //
   // A three-step flow mirroring the `connect` stepped modal: (1) configure the
   // repo + token + status mapping, (2) preview (dry-run) the counts, (3) run

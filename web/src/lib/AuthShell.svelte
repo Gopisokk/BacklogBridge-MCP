@@ -1,5 +1,5 @@
 <script lang="ts">
-  // LIF-203 v6: the auth screen IS Lific, signed out. It wears the real
+  // LIF-203 v6: the auth screen IS Merge, signed out. It wears the real
   // application chrome so you feel like you are already inside the product:
   //
   //   - the 230px --chrome sidebar (real brand header + version pill, a

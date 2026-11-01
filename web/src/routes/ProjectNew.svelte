@@ -180,7 +180,7 @@
   <div class="flex-1 overflow-y-auto">
     {#if canImportArchive}
       <div class="mx-auto w-full max-w-[680px] px-6 pt-6 text-body-sm text-[var(--text-muted)]">
-        Moving a project from another Lific instance?
+        Moving a project from another Merge instance?
         <button class="text-[var(--accent)] underline underline-offset-2" onclick={() => navigate("/projects/import")}>Import a project archive</button>
       </div>
     {/if}

@@ -927,7 +927,7 @@
               <div>
                 <p class="text-body-sm font-medium text-[var(--text)]">Archive project</p>
                 <p class="text-caption text-[var(--text-muted)] mt-0.5 leading-relaxed">
-                  Compresses the project into a single file on the server and removes it from Lific.
+                  Compresses the project into a single file on the server and removes it from Merge.
                   Nothing is lost: an instance admin can unarchive it from Settings, Instance.
                 </p>
                 {#if !showArchiveSection}

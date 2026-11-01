@@ -63,7 +63,7 @@
         : "Join this instance and start tracking work.",
   );
 
-  // ── Getting started, as real Lific issue rows ──
+  // ── Getting started, as real Merge issue rows ──
   // The flow is rendered in the app's own issue + status vocabulary. On a
   // successful signup the first step ticks from active to done, exactly the
   // way the app changes an issue's status, then we navigate in.
@@ -349,7 +349,7 @@
       </button>
     </form>
 
-    <!-- Getting started, in Lific's own issue + status vocabulary. These are
+    <!-- Getting started, in Merge's own issue + status vocabulary. These are
          your real next steps; the first ticks to done when signup succeeds. -->
     <div class="mt-8 pt-6 border-t border-[var(--border)]">
       <p class="text-micro font-semibold uppercase tracking-widest text-[var(--text-faint)] mb-2.5">

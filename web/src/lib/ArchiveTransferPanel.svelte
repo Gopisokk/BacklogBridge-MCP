@@ -57,7 +57,7 @@
   <section aria-labelledby="archive-transfer-heading" class="border-t border-[var(--border)] pt-6 space-y-3">
     <h2 id="archive-transfer-heading" class="text-body-sm font-semibold text-[var(--text)]">Project archive</h2>
     <p class="text-body-sm text-[var(--text-muted)]">
-      Copy this whole project to another Lific instance. The archive includes linked files,
+      Copy this whole project to another Merge instance. The archive includes linked files,
       history, deleted content and author names. It can contain sensitive text no longer visible
       in the project. Accounts and permissions are not included; author names transfer as text only.
     </p>
