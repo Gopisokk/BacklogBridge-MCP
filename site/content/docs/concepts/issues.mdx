@@ -1,0 +1,126 @@
+---
+title: Issues
+description: What an issue holds, what Lific does with each status, how blockers decide which work is ready, and what happens when an issue is deleted.
+---
+
+An issue is one piece of work inside a project. It is identified by the project's identifier and a number, such as `APP-42`, and it behaves the same whether it was created in the browser, by the CLI, over REST or by an agent over MCP.
+
+## Fields
+
+| Field | What it holds |
+| --- | --- |
+| `title` | A one-line summary. Required. |
+| `description` | Markdown. In the web UI, an identifier such as `APP-12`, `APP-DOC-3` or `APP-PLAN-2` in the text becomes a link. |
+| `status` | Where the work stands. New issues start in `backlog`. See [Status](#status). |
+| `priority` | `urgent`, `high`, `medium`, `low` or `none`. New issues start at `none`. |
+| `module` | At most one [module](/docs/concepts/modules-and-labels) from the same project. |
+| `labels` | Any number of the project's [labels](/docs/concepts/modules-and-labels). |
+| `assignees` | Who must do it: nobody (any agent), any person, or named people. See [Assignment](#assignment). |
+| `start_date`, `target_date` | Optional calendar dates, written `YYYY-MM-DD`. |
+| `created_at`, `updated_at` | Set by Lific. Adding a comment or changing labels also moves `updated_at`. |
+
+When you update an issue and include `labels`, the list you send becomes the issue's complete label set. Leave `labels` out to keep the current ones.
+
+The number in an identifier counts up within its project. A number is not handed out again while a deleted issue that held it is still in the trash, so restoring an issue never collides with a newer one.
+
+## Status
+
+Lific has five fixed statuses. Three are open and two are closed, and `done` is the only one with side effects.
+
+| Status | Meaning | Open or closed |
+| --- | --- | --- |
+| `backlog` | Recorded, not yet planned. | Open |
+| `todo` | Planned, not started. | Open |
+| `active` | Someone is working on it. | Open |
+| `done` | Finished. | Closed |
+| `cancelled` | Will not be done. | Closed |
+
+Moving an issue to `done` has two effects that `cancelled` does not:
+
+- Issues it blocks stop counting it as a blocker.
+- Plan steps that mirror it are checked off in active plans, and a plan anchored to it is archived. Moving the issue out of `done` again unchecks those steps. See [Plans](/docs/concepts/plans).
+
+A commit message such as `closes APP-42`, `fixes APP-42` or `resolves APP-42` moves the issue to `done` when you run [`lific git-hook`](/docs/cli) from a git hook or CI job.
+
+The [activity log](/docs/concepts/comments-and-activity) records every status change with who made it and through which interface.
+
+## Priority
+
+Priority is for sorting and filtering. When issues are sorted by priority the order is `urgent`, `high`, `medium`, `low`, then `none`. Lific attaches no other behavior to it.
+
+## Relations
+
+Two issues can be linked in one of three ways. Links may cross projects, but an issue cannot be linked to itself.
+
+| Type | Direction | How each issue shows it |
+| --- | --- | --- |
+| `blocks` | `APP-1` blocks `APP-2` | `APP-1` lists **Blocks** `APP-2`; `APP-2` lists **Blocked by** `APP-1`. |
+| `relates_to` | None | Both issues list the other as related. |
+| `duplicate` | `APP-3` duplicates `APP-1` | `APP-3` lists **Duplicate of** `APP-1`; `APP-1` lists **Duplicated by** `APP-3`. |
+
+Only `blocks` changes behavior. A duplicate is not closed automatically; set its status yourself.
+
+When project-scoped authorization is enforced, every read leaves out related issues in projects you cannot view: the issue detail, the issue list and board (web, REST and MCP), and exports. There is no placeholder or count, so a hidden relation does not reveal that the other issue exists. Admins, and instances without enforcement, see every relation.
+
+## Assignment
+
+Assignment says whether an agent may take an issue. An issue is in one of three states:
+
+| State | Set with | Meaning |
+| --- | --- | --- |
+| Unassigned | `[]` or nothing | Any agent may work it, unless it is blocked, `done` or `cancelled`. This is the default. |
+| Human | `["human"]` | Some person must do it. Nobody in particular. |
+| Named people | `["ada-lovelace", "me"]` | These people must do it. |
+
+Only human accounts can be named; an agent's own account cannot, because unassigned already means "any agent". `me` stands for the caller, and for an agent it stands for the person who connected it. A named person must be able to see the project. Human and named people are exclusive in one request. Every write replaces the whole assignment, and the activity log records each person added or removed.
+
+Responses carry `needs_human` (true for the second and third states) and `assignees` (the named people). `workable=true` does not look at assignment; filter with `assignee`: `none` for the agents' pool, `human` for every issue a person must do, `me`, or a username. The web UI's home page lists the open issues that name you, the ones marked for any person, and the ones waiting on you.
+
+Assignments are private: the public view of a [published project](/docs/public-projects) leaves them out. A project archive carries them by username; on import, a name with no matching person falls back to "any person".
+
+## Waiting on a person or a date
+
+Some work is blocked by something that is not an issue: a decision someone owes you, or a reply that should arrive next week. Record that as a wait instead of a placeholder issue.
+
+| Kind | Blocks until | Example |
+| --- | --- | --- |
+| User | Someone clears the wait | Waiting on `@ada-lovelace` to decide the schema |
+| Date | The first day of its window | Waiting for 2026-09-28 to 2026-10-02, "state filing office" |
+
+A date wait has an earliest and a latest day, and a single date is a window of one day. On any given day it is in one of three states:
+
+| State | When | Blocks the issue? |
+| --- | --- | --- |
+| Holding | Before the earliest day | Yes |
+| Due | From the earliest day through the latest day | No, and it is shown as due to check |
+| Overdue | After the latest day | No, and it is shown as overdue |
+
+A due or overdue wait stays on the issue until someone clears it, so the follow-up is not forgotten. A user wait holds until it is cleared. Clearing a wait removes it, and the activity log records both the wait and the clear.
+
+"Today" is the server's local calendar day, for every client. MCP, the REST API and the web UI therefore agree on whether an issue is blocked even when a browser is in another timezone.
+
+An issue can wait on a given person once and on a given window once. A wait's note is at most 500 characters. Waits are private: the public view of a [published project](/docs/public-projects) leaves them out. Add and clear waits in the web UI's **Waiting on** field, with MCP `link_issues` and `unlink_issues`, or through `/api/issues/{id}/waits`.
+
+## Ready and blocked work
+
+Two filters answer "what can be worked on now" without walking the relation graph yourself. Both exist on the MCP `list_issues` tool and the REST issue list; the CLI has `lific issue list --workable`.
+
+`workable=true` returns issues that are open (not `done` or `cancelled`), whose blocking issues are all `done`, and that have no holding wait. A deleted blocker no longer counts.
+
+`blocked=true` returns issues with at least one blocking issue that is not `done`, or at least one holding wait. It does not look at the issue's own status, so a closed issue with an open blocker still appears.
+
+A blocker that was `cancelled` still blocks. That is deliberate: cancelling the prerequisite does not make the dependent work possible. When the dependency no longer matters, remove the `blocks` relation.
+
+## Deleting and restoring
+
+Deleting an issue moves it to the trash, along with its comments. It disappears from lists, search, boards and [public projects](/docs/public-projects) straight away. For the next 30 days, a maintainer can restore it with `POST /api/issues/{id}/restore`, and its comments come back with it. After that the retention sweep removes it permanently. Change the window with `trash_days` in the [`[retention]`](/docs/configuration#retention) section of the configuration.
+
+The trash protects against mistakes. It is not a backup; use the automatic backups or `lific dump` for that.
+
+## Concurrent edits
+
+By default the last write wins. To avoid overwriting someone else's change, send the `expected_seq` you last read with an update. If the issue has changed since, the update is refused: REST answers `409` with the current issue, and MCP returns an error. For a small change to a long description, `edit_issue` replaces one exact string and leaves the rest of the text untouched.
+
+## Who can change an issue
+
+When project membership is enforced, reading an issue takes the `viewer` role in its project, and creating, editing, assigning, linking, adding or clearing a wait, deleting or restoring one takes `maintainer`. Linking two issues in different projects takes `maintainer` in both. [Projects](/docs/concepts/projects#members-and-roles) describes the roles.

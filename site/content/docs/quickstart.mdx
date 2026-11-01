@@ -1,0 +1,103 @@
+---
+title: Quickstart
+description: Create a Lific instance on your machine, sign in, connect your AI tools, and create a first project and issue.
+---
+
+This page takes you from an installed `lific` binary to a running tracker that your coding agent can use. If `lific --version` does not work yet, start with [Installation](/docs/installation).
+
+## Create the instance
+
+```bash
+lific init
+```
+
+`lific init` does the whole setup in one command. It writes a configuration file, creates the database, creates your administrator account, and on Linux and macOS installs Lific as a background service and starts it (a systemd user unit on Linux, a LaunchAgent on macOS). The server listens on port `3456` and keeps running after you close the terminal or reboot. Check on it later with `lific service status`.
+
+On a fresh install, `init` asks for your name and how people should sign in.
+
+| Mode | What it sets up | Choose it when |
+| --- | --- | --- |
+| Login-free | No passwords. The server listens on `127.0.0.1` only, and the browser signs you in automatically. | Lific is for you alone on this machine. Anyone who can reach the port can administer the instance, so do not expose it. |
+| Passwords | You pick an administrator password, and everyone signs in. | Anyone else can reach the machine, or you plan to add other people. |
+
+In scripts, pass the answers as flags instead:
+
+```bash
+lific init --auth-mode login-free --name "Ada Lovelace"
+lific init --auth-mode passwords --name "Ada Lovelace" --password "<PASSWORD>"
+```
+
+`init` does not create an API key. `lific connect` creates the keys your AI tools need, and `lific key create` makes one by hand.
+
+### Without a background service
+
+Containers and Linux machines without a systemd user session have no service manager Lific can use. There, create the instance without one and run the server in a terminal you keep open:
+
+```bash
+lific init --no-service
+lific start
+```
+
+On Windows, `lific init` installs a per-user startup entry instead; [Windows](/docs/windows) walks through that platform in full.
+
+### Where the files go
+
+By default the instance lives in your operating system's standard directories, so `lific` finds the same instance from any working directory.
+
+| Platform | Configuration | Database |
+| --- | --- | --- |
+| Linux | `~/.config/lific/lific.toml` | `~/.local/share/lific/lific.db` |
+| macOS | `~/Library/Application Support/lific/lific.toml` | `~/Library/Application Support/lific/lific.db` |
+| Windows | `%APPDATA%\lific\lific.toml` | `%APPDATA%\lific\lific.db` |
+
+Add `--here` to keep the instance in the current directory instead, as `./lific.toml` and `./lific.db`. Attachments and automatic backups are stored next to the database.
+
+## Sign in
+
+Open [http://127.0.0.1:3456](http://127.0.0.1:3456).
+
+In login-free mode you are signed in as the administrator already. In password mode, sign in with your username and the password you chose. Your username is your name in lowercase with hyphens between words: `Ada Lovelace` becomes `ada-lovelace`.
+
+## Connect your AI tools
+
+```bash
+lific connect
+```
+
+`connect` asks how your tools should reach Lific, then which tools to configure. Tools it finds on your machine are already selected. For each one it writes a `lific` entry into that tool's MCP configuration and creates a separate API key, so the activity log shows which tool made each change and you can revoke one without touching the others.
+
+The default transport, local stdio, has your tool start `lific mcp` itself and talk to the database directly, so it works even while the server is stopped. [Connect agents](/docs/connect) explains the other transports and lists every supported tool.
+
+Restart the tool, then check the connection by asking your agent:
+
+> List my Lific projects.
+
+A fresh instance has none, and the agent should say so rather than report an error.
+
+## Create a project and an issue
+
+Ask your agent, or use the CLI. Both write to the same database.
+
+```bash
+lific project create --name "Example" --identifier EX
+lific issue create --project EX --title "Write the README"
+lific issue list --project EX
+```
+
+The issue is `EX-1`. A project identifier is one to five uppercase letters or digits, starts with a letter, and prefixes every issue number in the project. `DOC` is reserved for workspace pages.
+
+These commands work on the database directly and do not need the server. To run them against a remote server instead, see the [CLI reference](/docs/cli).
+
+## Check the setup
+
+```bash
+lific doctor
+```
+
+`doctor` checks the configuration, the database, the running server, OAuth discovery and a real MCP round trip. It exits with a nonzero status when something is broken, so scripts and agents can rely on it.
+
+## Next steps
+
+- In a git checkout, run `lific bind EX` so agents working there use project `EX` without being told. See [Repository bindings](/docs/repository-bindings).
+- To add people, have them sign up in the browser or create accounts with `lific user create`. Signup is open by default, so anyone who can reach the server can make an ordinary account; an administrator can close it in instance settings. `lific user promote --username <name>` makes someone an administrator. [Self-hosting](/docs/self-hosting) covers accounts, backups and running Lific for a team.
+- [Concepts](/docs/concepts) explains how projects, issues, pages and plans fit together.

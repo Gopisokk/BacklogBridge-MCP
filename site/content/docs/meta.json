@@ -1,0 +1,27 @@
+{
+  "pages": [
+    "---Get started---",
+    "index",
+    "installation",
+    "quickstart",
+    "connect",
+    "windows",
+    "---Guides---",
+    "web-ui",
+    "self-hosting",
+    "repository-bindings",
+    "git-hooks",
+    "public-projects",
+    "project-archives",
+    "archiving-projects",
+    "upgrading",
+    "---Concepts---",
+    "concepts",
+    "---Reference---",
+    "mcp",
+    "rest-api",
+    "cli",
+    "configuration",
+    "limits"
+  ]
+}

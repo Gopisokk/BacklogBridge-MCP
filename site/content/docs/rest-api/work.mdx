@@ -1,0 +1,373 @@
+---
+title: Issues, pages and plans
+description: Create, update, link, delete and restore issues; park issues on a person or a date; write comments; manage pages, plans, modules, labels and folders; read each item's activity.
+---
+
+The [concept pages](/docs/concepts) explain what each of these is for. The `Issue`, `Page`, `Comment`, `Module`, `Label` and `Folder` shapes are defined once in [Shared shapes](/docs/rest-api#shared-shapes).
+
+## Issues
+
+### GET `/api/issues`
+
+Lists issues. **Viewer** on the project when `project_id` is given; without it, issues from every project you can read. Returns an `Issue` array without relation arrays or `source`.
+
+Every query parameter is optional:
+
+| Parameter | Meaning |
+| --- | --- |
+| `project_id` | Only this project. |
+| `status`, `priority` | One exact value. |
+| `module_id` | Only this module. |
+| `label` | Only issues carrying this label name. |
+| `assignee` | `none` (free for agents), `human` (a person must do it), `me`, or a username. |
+| `workable` | `true`: open issues whose blockers are all `done` and that have no wait still holding. |
+| `blocked` | `true`: issues with at least one blocker that is not `done`, or a wait still holding, whatever their own status. |
+| `created_since`, `updated_since` | Inclusive lower bound, a date or date-time. |
+| `created_until`, `updated_until` | Exclusive upper bound. |
+| `order_by` | `sort_order` (default), `sequence`, `created`, `updated` or `priority`. `created_at` and `updated_at` also work. |
+| `order` | `asc` (default) or `desc`. |
+| `limit`, `offset` | Default 50, at most 500. |
+
+The [issues concept page](/docs/concepts/issues#ready-and-blocked-work) explains why a `cancelled` blocker still blocks. An issue with [waits](#waits) carries them in `waits`, in lists as well as single reads. Every issue carries `needs_human`, and an issue that names people carries them in `assignees` as `{user_id, username, display_name}`; see [Assignment](/docs/concepts/issues#assignment).
+
+### POST `/api/issues`
+
+Creates an issue. **Maintainer.**
+
+Body: `project_id` and `title`, then optionally `description` (Markdown), `status` (default `backlog`), `priority` (default `none`), `module_id`, `start_date` and `target_date` (`YYYY-MM-DD`), `labels`, `source` and `assignees` (`["human"]`, or usernames with `"me"` for you). `labels` are names of labels that already exist in the project; a name that matches none is ignored. A module from another project is `400`.
+
+Attachments referenced from the description as `/api/attachments/{id}` are linked to the new issue if you uploaded them, are an administrator, or they are already linked somewhere in the same project.
+
+Returns the `Issue`.
+
+```bash
+curl -X POST "$LIFIC/api/issues" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"project_id":1,"title":"Crash on empty cart","priority":"urgent","labels":["bug"]}'
+```
+
+### GET `/api/issues/attention`
+
+What is waiting on you, across every project you can see: `{"assigned": [...], "human": [...], "waiting": [...]}`, each an `Issue` array of open issues (not `done` or `cancelled`), most recently updated first, at most 50. `assigned` names you, `human` is marked for any person, and `waiting` has a [wait](#waits) on you. An issue can be in `waiting` and one of the others. For an agent's key, "you" is the person who connected it. The web home page shows this.
+
+### GET `/api/issues/{id}`
+
+One issue with its relations. **Viewer.** An issue in the trash is `404`.
+
+### GET `/api/issues/resolve/{identifier}`
+
+The same, by identifier such as `APP-42`. Case does not matter. **Viewer.**
+
+### PUT `/api/issues/{id}`
+
+Changes an issue. **Maintainer.** Every field is optional: `title`, `description`, `status`, `priority`, `module_id` (null unassigns), `sort_order`, `start_date`, `target_date`, `labels`, `assignees` and `expected_seq`. An issue cannot move between projects. `assignees`, when present, replaces the assignment: `[]` frees the issue for agents. Naming a bot, someone who cannot see the project, or `human` together with names is `400`.
+
+`labels`, when present, becomes the complete label set; leave it out to keep the current labels. Send `expected_seq` to refuse the update with `409` if somebody else changed the issue since you read it; see [Concurrent edits](/docs/rest-api#concurrent-edits-and-expected_seq).
+
+Moving an issue to `done` checks off plan steps that mirror it and archives a plan anchored to it; moving it out of `done` unchecks them. Returns the `Issue`.
+
+```bash
+curl -X PUT "$LIFIC/api/issues/42" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"done","expected_seq":118}'
+```
+
+### DELETE `/api/issues/{id}`
+
+Moves the issue and its comments to the trash. **Maintainer.** It disappears from lists, boards, search and public projects at once. Returns `{"deleted": true}`.
+
+Trashed issues are removed for good after 30 days, or whatever `trash_days` in the [`[retention]`](/docs/configuration#retention) section says. Its number is not reused while it is in the trash.
+
+### POST `/api/issues/{id}/restore`
+
+Brings an issue back from the trash, with the comments that went with it. **Maintainer.** No body. Returns the restored `Issue`. An id that is not in the trash, including one already purged, is `404`.
+
+There is no endpoint that lists the trash. Keep the id from the delete if you might want to restore it.
+
+## Relations
+
+Relations are `blocks`, `relates_to` and `duplicate`. They may cross projects; every endpoint here needs **maintainer** on both issues' projects. The [issues concept page](/docs/concepts/issues#relations) explains the direction of each.
+
+### POST `/api/issues/link`
+
+Links two issues. Body: `source` and `target` (identifiers) and `relation_type`. Linking an issue to itself or using another type is `400`; linking a pair that is already linked that way does nothing. Returns `{"linked": true}`.
+
+```bash
+curl -X POST "$LIFIC/api/issues/link" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"source":"APP-12","target":"APP-15","relation_type":"blocks"}'
+```
+
+### POST `/api/issues/unlink`
+
+Removes every relation between two issues, in either direction. Body: `source` and `target`. Returns `{"unlinked": true}`.
+
+### POST `/api/issues/reverse`
+
+Flips the direction of the relations that run from `source` to `target`, in one step, so a failure leaves the original relation in place. Body: `source` and `target`. No relation in that direction is `404`. Returns `{"reversed": true}`.
+
+### GET `/api/projects/{id}/relations`
+
+Every relation between two issues of this project, for drawing a dependency graph in one request. **Viewer.** Returns an array of `source_id`, `source_identifier`, `target_id`, `target_identifier` and `relation_type`. Waits are not relations and do not appear here.
+
+## Waits
+
+A wait blocks an issue on something that is not another issue: a person, or a window of days. A user wait holds until someone clears it. A date wait holds before its `earliest` day, is due from `earliest` through `latest`, and is overdue after `latest`. Only a holding wait blocks, for the `workable` and `blocked` filters as for everything else. "Today" is the server's local calendar day. [Waiting on a person or a date](/docs/concepts/issues#waiting-on-a-person-or-a-date) covers the model.
+
+A `Wait` has `id`, `issue_id`, `kind` (`user` or `date`), `note` (a string, empty when there is none), `state` and `created_at`. A user wait adds `user_id`, `username` and `display_name`. A date wait adds `earliest` and `latest` (`YYYY-MM-DD`; equal for a single day). `state` is `holding`, `due` or `overdue`, worked out on the server's day when the response was built. A client that keeps a wait across midnight should recompute it from `earliest` and `latest`, using [`GET /api/clock`](#get-apiclock).
+
+```json
+{
+  "id": 5,
+  "issue_id": 42,
+  "kind": "date",
+  "earliest": "2026-09-28",
+  "latest": "2026-10-02",
+  "note": "state filing office",
+  "state": "holding",
+  "created_at": "2026-09-25 14:02:11"
+}
+```
+
+Issue responses, `/index` rows and `/changes` rows carry an issue's waits as a `waits` array, left out when there are none. The [public read API](/docs/rest-api/public) never shows them. Adding or clearing a wait moves the issue's `seq`, records the change in the issue's activity, and publishes `issue.updated`.
+
+### GET `/api/issues/{id}/waits`
+
+The issue's waits: user waits first, then date waits by first day. **Viewer.** Returns a `Wait` array.
+
+### POST `/api/issues/{id}/waits`
+
+Adds a wait. **Maintainer.** Body: `user` (a username; a leading `@` is fine), or `from` (a date) with optional `until` (a date, default `from`). Either may carry `note`, up to 500 characters. Returns the new `Wait`.
+
+These are `400`: both `user` and `from`, neither, `until` without `from` or with `user`, a username with no active account, a date not in `YYYY-MM-DD` form, an `until` before `from`, and a note over 500 characters. A wait the issue already has, meaning the same person or the same window, is `409`.
+
+```bash
+curl -X POST "$LIFIC/api/issues/42/waits" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"from":"2026-09-28","until":"2026-10-02","note":"state filing office"}'
+```
+
+### DELETE `/api/issues/{id}/waits/{wait_id}`
+
+Clears a wait. **Maintainer.** A `wait_id` that does not exist, or belongs to another issue, is `404`. Returns `{"cleared": true}`.
+
+### GET `/api/clock`
+
+The server's calendar day and its offset from UTC, which decide whether a date wait is holding, due or overdue. Any signed-in caller; a request with no identity is `403`. No parameters.
+
+```json
+{ "today": "2026-09-25", "utc_offset_minutes": -300 }
+```
+
+`utc_offset_minutes` is minutes east of UTC. A client that works out wait states itself should compute today at this offset, not in its own timezone, so that it agrees with the server. The web UI does this so an open tab turns over at the server's midnight.
+
+## Comments
+
+Anyone who can read a project can comment in it: **viewer**. On a workspace page, that means an administrator when enforcement is on. Deleting an issue or page takes its comments to the trash with it.
+
+### GET `/api/issues/{issue_id}/comments`
+
+### GET `/api/pages/{page_id}/comments`
+
+One page of the comments on an issue or a page. Returns a `Comment` array.
+
+| Parameter | Meaning |
+| --- | --- |
+| `order` | `asc` (default, oldest first) or `desc`. |
+| `limit`, `offset` | Default 50, at most 500. |
+| `author` | Only comments by this username. |
+| `before_created_at`, `before_id` | A cursor: only comments older than the one you name. |
+
+The default page of a long thread is its oldest comments; pass `order=desc` for the newest.
+
+A response is also cut short at about 2 MiB of comment text, so a short page does not mean the thread has ended. Read the response headers instead:
+
+| Header | Meaning |
+| --- | --- |
+| `x-comment-has-more` | `true` when more comments follow. |
+| `x-comment-returned` | How many comments this page holds. |
+| `x-comment-next-offset` | The `offset` for the next page, when paging by offset. |
+| `x-comment-next-created-at`, `x-comment-next-id` | The cursor for the next page, when reading with `order=desc`. |
+
+To page backwards through a thread that people are still writing to, use the cursor rather than `offset`: an offset shifts every time a comment is posted, so the next page repeats or skips one, while a cursor names a fixed position. Send both halves, with `order=desc` and no `offset`; anything else is `400`.
+
+If even the first comment is larger than the budget, the answer is `413` with the offset or cursor that skips it, so a client can step past it on purpose. Comments are never skipped silently.
+
+### POST `/api/issues/{issue_id}/comments`
+
+### POST `/api/pages/{page_id}/comments`
+
+Adds a comment. Body: `content` (Markdown). A comment added here is always of kind `comment`; `verification` comments come only from closing an issue with evidence through MCP `update_issue`. A body may be at most 256 KiB, with at most 256 distinct `@`-mentions and 256 distinct attachment references; more is `400`. Returns the `Comment`.
+
+### PUT `/api/comments/{id}`
+
+Replaces a comment's text. Body: `content`. Only the author or an administrator, and only while they can still read the project; anyone else gets `400`. The create limits apply, except that a body already over 256 KiB may be edited as long as it does not grow. Returns the `Comment`.
+
+### DELETE `/api/comments/{id}`
+
+Deletes a comment. Same rule: the author or an administrator who can read the project. There is no endpoint to restore a single comment. Returns `{"deleted": true}`.
+
+## Pages
+
+A page has a project, or none for a workspace page. With enforcement on, workspace pages are administrator-only for reading and writing.
+
+### GET `/api/pages`
+
+Lists pages. **Viewer** on `project_id`. Without `project_id`, lists workspace pages only, and `folder_id` is ignored.
+
+Query: `project_id`, `folder_id`, `label`, `status`, `order_by` (`sort_order`, `title`, `status`, `created` or `updated`), `order` (`asc` or `desc`), `limit` and `offset`. Returns every match unless `limit` or `offset` is given; then at most 500. Returns a `Page` array.
+
+### POST `/api/pages`
+
+Creates a page. **Maintainer**, or administrator for a workspace page.
+
+Body: `title`, and optionally `project_id`, `folder_id`, `content` (Markdown), `status` (`draft` by default, or `active`, `complete`, `archived`) and `labels` (names; ignored on workspace pages). Returns the `Page`.
+
+### GET `/api/pages/{id}`
+
+One page with its content. **Viewer.**
+
+### GET `/api/pages/resolve/{identifier}`
+
+The same, by identifier: `APP-DOC-3`, or `DOC-3` for a workspace page. **Viewer.**
+
+### PUT `/api/pages/{id}`
+
+Changes a page. **Maintainer.** Every field is optional: `title`, `content`, `folder_id` (null moves it to the top level), `sort_order`, `status`, `pinned`, `labels` (replaces the set) and `expected_seq`. A stale `expected_seq` is `409`, as for issues. Returns the `Page`.
+
+### DELETE `/api/pages/{id}`
+
+Moves the page and its comments to the trash. **Maintainer.** Returns `{"deleted": true}`.
+
+### POST `/api/pages/{id}/restore`
+
+Brings a page back from the trash, with its comments. **Maintainer.** No body. Returns the `Page`. An id that is not in the trash is `404`.
+
+## Plans
+
+A plan is a tree of steps kept across sessions, optionally anchored to one issue. The [plans concept page](/docs/concepts/plans) covers how steps mirror issues.
+
+A plan has `id`, `project_id`, `sequence`, `identifier` (`APP-PLAN-2`), `issue_id` and `anchor_identifier` (the anchor issue, when set), `title`, `status` (`active`, `done` or `archived`), `created_at`, `updated_at`, `step_count`, `done_count` and `steps`.
+
+Each step has `id`, `plan_id`, `parent_step_id`, `position`, `title`, `description`, `issue_id`, `issue_identifier` and `issue_status` (when it mirrors an issue), `done`, `reopened_via_issue_at` (set when reopening the issue unchecked it), `created_at`, `edited_at` and `children`.
+
+### GET `/api/plans`
+
+Lists plans without their step trees (`steps` is empty; the counts are filled in). **Viewer.** Query: `project_id`, `status`, `order_by` (`updated`, the default, or `id`), `limit`, `offset`, and `before_id` for keyset paging, which needs `order_by=id`.
+
+### POST `/api/plans`
+
+Creates a plan, with as much of its step tree as you like, in one request. **Maintainer.**
+
+Body: `project_id`, `title`, optional `issue_id` (the anchor) and optional `steps`. Each step has `title` and optionally `description`, `issue_id`, `done` and its own `steps`. Returns the plan with its tree.
+
+```json
+{
+  "project_id": 1,
+  "title": "Ship offline mode",
+  "steps": [
+    { "title": "Cache reads", "steps": [{ "title": "Issues" }, { "title": "Pages" }] },
+    { "title": "Queue writes", "issue_id": 42 }
+  ]
+}
+```
+
+### GET `/api/plans/{id}`
+
+### GET `/api/plans/resolve/{identifier}`
+
+One plan with its full tree, by id or by identifier. **Viewer.**
+
+### PUT `/api/plans/{id}`
+
+Changes `title`, `status` or `issue_id` (null removes the anchor). **Maintainer.** Returns the plan with its tree.
+
+### DELETE `/api/plans/{id}`
+
+Deletes the plan and its steps permanently. Plans have no trash. **Maintainer.** Returns `{"deleted": true}`.
+
+### POST `/api/plans/{id}/steps`
+
+Adds a step to the plan, under `parent_step_id` when given. **Maintainer.** Body: `title`, and optionally `parent_step_id`, `description` and `issue_id`. Returns the plan with its tree.
+
+### PUT `/api/plans/{plan_id}/steps/{step_id}`
+
+Edits, moves, links or checks off a step. **Maintainer**, and also maintainer on the issue's project when you link the step to an issue or check off a step that mirrors one.
+
+Body, every field optional: `title`, `description`, `done`, `issue_id` (null unlinks), and to move the step, `move_parent_step_id` or `move_to_root: true` with an optional `move_position`.
+
+Returns `plan` (the plan with its tree). When the request set `done`, it also returns `effect`: `step_id`, `done`, `issue_identifier`, `issue_status_changed` and `issue_new_status`, which say whether checking the step also changed the mirrored issue.
+
+### DELETE `/api/plans/{plan_id}/steps/{step_id}`
+
+Deletes a step and the steps under it. **Maintainer.** Returns the plan with its tree.
+
+## Modules, labels and folders
+
+Reading these needs **viewer**. Changing them needs **maintainer** with enforcement on and **lead** with it off.
+
+### GET `/api/modules`
+
+### GET `/api/labels`
+
+### GET `/api/folders`
+
+The project's modules, labels or folders. Query: `project_id`, required.
+
+### GET `/api/modules/{id}`
+
+One module.
+
+### POST `/api/modules`
+
+Body: `project_id`, `name`, and optionally `description`, `status` (default `active`) and `emoji`. Returns the `Module`.
+
+### PUT `/api/modules/{id}`
+
+Changes `name`, `description`, `status` or `emoji` (null clears it). Returns the `Module`.
+
+### DELETE `/api/modules/{id}`
+
+Deletes the module. Its issues stay, with no module. Returns `{"deleted": true}`.
+
+### POST `/api/labels`
+
+Body: `project_id`, `name` and optional `color` (default `#6B7280`). Returns the `Label`.
+
+### PUT `/api/labels/{id}`
+
+Changes `name` or `color`. Returns the `Label`.
+
+### DELETE `/api/labels/{id}`
+
+Deletes the label and removes it from every issue and page. Returns `{"deleted": true}`.
+
+### POST `/api/labels/{id}/merge`
+
+Moves everything labelled `{id}` onto another label in the same project, then deletes `{id}`. Body: `into` (the surviving label's id). Labels in different projects are `400`. Returns the surviving `Label`.
+
+### POST `/api/folders`
+
+Body: `project_id`, `name` and optional `parent_id`. Returns the `Folder`.
+
+### PUT `/api/folders/{id}`
+
+Renames a folder. Body: `name`. A folder's project and parent are fixed. Returns the `Folder`.
+
+### DELETE `/api/folders/{id}`
+
+Deletes the folder and the folders inside it. Their pages are kept and move to the top level. Returns `{"deleted": true}`.
+
+## Activity
+
+### GET `/api/issues/{id}/activity`
+
+### GET `/api/pages/{id}/activity`
+
+### GET `/api/plans/{id}/activity`
+
+One item's history, newest first. A plan's feed includes its steps. **Viewer**, or administrator for a workspace page with enforcement on. Query: `limit` (default 50, at most 200) and `offset`. Returns `items` and `has_more`, in the shape described under [project activity](/docs/rest-api/projects#get-apiprojectsidactivity).

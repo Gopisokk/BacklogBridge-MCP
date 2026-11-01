@@ -1,0 +1,145 @@
+---
+title: Project archives
+description: Move one project to another Lific instance with its content, files and history, then check the new private copy before switching over.
+---
+
+A project archive is a single file holding one project: its issues, pages, plans, comments, modules, labels, folders, attached files and full change history, including deleted items. Importing it creates a new private project on another Lific instance.
+
+An import never merges into an existing project, never overwrites one with the same identifier, and never changes or deletes the source.
+
+Use a different tool for other jobs:
+
+- To read or share a project as text, use a Markdown [export](/docs/cli#export-project). It cannot be imported.
+- To back up or restore a whole instance, including accounts and settings, use [backup and restore](/docs/self-hosting#manual-backup-and-restore).
+
+## Before you start
+
+- **The archive contains more than the project shows today.** Deleted issues, pages and comments and every past version of every description travel with it, so text that was removed for being secret is still in the file. Treat the archive as private data and transfer it securely.
+- **Stop writing to the source first.** Changes made on the source after the export do not reach the destination. Pause people and agents before the final export, and keep the source as the working copy until you have checked the destination.
+- **Accounts do not move.** Members, roles, API keys and connected tools stay behind. You set up access again on the destination.
+
+## Who can do it
+
+| Action | Web UI | CLI |
+| --- | --- | --- |
+| Export | The project's lead or an instance administrator, signed in to the source in a browser. | Anyone who can run `lific` against the source database file. |
+| Import | An instance administrator, signed in to the destination in a browser. | Anyone who can run `lific` against the destination database file, naming an active administrator with `--user`. |
+
+The web routes accept only a signed-in browser session. API keys, OAuth tokens, connected tools, and the automatic administrator an instance without authentication uses are all refused, because an archive holds the project's entire history. Import requires an administrator even when project permissions are not enforced.
+
+There is no MCP interface for archives.
+
+## Move a project in the web UI
+
+Use this when you can sign in to both instances.
+
+1. On the source, open the project's **Overview** and find **Project archive**. Only the lead and administrators see it.
+2. Read the warning about history, confirm it, and choose **Download project archive**. This saves `<ID>.lific.tar.gz` and leaves the project unchanged. The **Export** button in the top bar is the Markdown export, not an archive.
+3. On the destination, sign in as an administrator, choose **New project**, then **Import a project archive**. This works on an instance with no projects yet.
+4. Choose the file, check the name and size shown, read the confirmation, and choose **Import as private project**. The page shows the destination's upload limits; use the CLI for anything larger.
+5. Wait for the result. The upload percentage measures bytes sent; **Importing...** means the server is processing the file, and it cannot be canceled. The operation and its result survive leaving and returning to the import page in the same tab.
+6. Review the result: record and file counts, and any references that could not be carried over (the first 100 are listed, with the total). Then choose **Open imported project**.
+
+If the connection or page is lost during an import, the import may still finish on the server. Check the destination's project list before trying again. The UI never retries an import by itself.
+
+## Move a project with the CLI
+
+Use this when you have access to both database files, or when the archive is too large for the web limits.
+
+```sh
+lific --db /srv/old/lific.db project-archive export APP --out /srv/backups/APP.tar.gz
+# Copy APP.tar.gz securely to the destination machine.
+lific --db /srv/new/lific.db project-archive import /srv/backups/APP.tar.gz --user ada-lovelace
+```
+
+- The destination database and the administrator named by `--user` must already exist. That administrator becomes the new project's lead.
+- `--config` selects a configuration instead of `--db`.
+- `--out` must name a file that does not exist yet. On Unix the archive is created readable only by its owner; on other systems, restrict the folder you write it to.
+- Both commands print a JSON report with the project identifier, row and file counts, and references that could not be carried over. An error exits with a nonzero status.
+
+See [`project-archive`](/docs/cli#project-archive) in the CLI reference.
+
+## After importing
+
+1. Read the reference report.
+2. Open a few issues and pages, check some deleted content and history, and download an attachment.
+3. Add members on the destination and give them roles.
+4. If agents work on this project from a git checkout, set up its [repository binding](/docs/repository-bindings) on the destination. Bindings are not in the archive.
+5. Point people and agents at the destination. Until then, the source is still the working copy.
+
+The imported project is private, even if the source was published. To publish it, review its content and files first and then follow [Public projects](/docs/public-projects).
+
+## What transfers
+
+- The project, its modules, labels and folders.
+- Issues, pages, plans and plan steps, and comments, including deleted ones. Each comment keeps its kind, so verification evidence recorded when an issue was closed arrives as verification evidence.
+- Labels on issues and pages, relations between issues in the project, and links between pages and issues.
+- Attached files that are linked to exported content.
+- Waits on a person or a date, with their notes. A wait on a person names that person by username and is bound to the destination account with the same username; when no active account has that name, the wait is left out and listed in the report. Date waits transfer as written.
+- Assignments. Named people travel by username and bind to the destination's active human account with the same name. A name with no such account is listed in the report, and an issue left with nobody named is marked for any person instead, so it never drops into the agents' pool.
+- The project's change history and status history. The version history `get_page(since_seq)` reads from does not transfer; an imported page starts its history at its next edit.
+
+Issue, page and plan numbers, timestamps, ordering, statuses and issue import sources are kept. Internal database IDs are assigned fresh on the destination, and every link between exported records is updated to match.
+
+Links to attachments written as `/api/attachments/123` in descriptions, comments, pages and history are rewritten to the new file IDs. A link to a file that is not in the archive is changed to `/unresolved-source-attachment/123`, so it cannot point at an unrelated file on the destination, and it is listed in the report. Links written as full URLs are left as they are and listed for you to check. Other text is not changed or cleaned.
+
+Relations to issues in other projects are left out and listed in the report. Neighboring projects are never included.
+
+## What does not transfer
+
+Accounts, passwords, API keys, OAuth data, sessions, instance settings, members and roles, sidebar groups, saved views, repository bindings and sync cursors. Mentions stay in comment text, but the notifications tied to accounts do not. The destination rebuilds search indexes and thumbnails itself.
+
+## Authors and history
+
+Imported comments and files are not linked to any account on the destination. Each comment shows its original author's name marked `(imported)`. An account on the destination with the same username does not become the author and gets no extra permission. The API reports these comments with `user_id: -1`, which means "no account", not a user to look up. Files have no uploader, and history entries have no actor account.
+
+Imported history entries are marked with the `imported` transport, and each keeps its original record, with source IDs, as provenance. Those source IDs do not refer to anything on the destination. Lific also stores when and from where the project was exported, and the full reference report. Exporting the imported project again carries all of this along.
+
+## Limits
+
+The CLI runs as someone who already has the database file, so it gets much larger limits than an upload to a shared server.
+
+| Limit | CLI | Web |
+| --- | --- | --- |
+| Archive file (compressed) | 2 GiB | 128 MiB |
+| Archive contents (decompressed) | 2 GiB plus 80 MiB | 256 MiB |
+| Project data (manifest) | 64 MiB | 16 MiB |
+| Rows | 200,000 | 50,000 |
+| Distinct files | 10,000 | 2,000 |
+| One file | 256 MiB | 64 MiB |
+| All files together | 2 GiB | 192 MiB |
+| Folder or step nesting | 128 levels | 128 levels |
+
+The same row and data limits cap the reference report and rewritten text. An archive that fails any limit is refused while it is being read or written, before anything is created. Use the CLI for a project that is too large for the web.
+
+Over the web, one archive export or import runs at a time on the whole instance. A second request is refused with `429` instead of waiting.
+
+## When an import fails
+
+A failed import leaves no partial project behind. Files are checked before the database is touched, and the project, its records and its search indexes appear all at once or not at all. Existing files on the destination are never overwritten or removed.
+
+A failure or crash can leave newly copied files that nothing uses. Do not delete files from the attachment directory by hand to clean up; keep the archive, fix the reported problem, and import again.
+
+An archive is refused if it is damaged or unsafe: an unknown format version, an unexpected table or field, duplicate or inconsistent records, circular folders or steps, unsafe paths, links, missing files, or a file whose size or checksum does not match. Checksums catch damaged files; they do not prove who made the archive.
+
+## Reference
+
+### Archive format
+
+An archive is a gzip-compressed tar file. It starts with `manifest.json`, followed only by files named `blobs/<sha256>`. The format version (currently 2) is separate from the database schema version. Version 2 added each comment's kind. Lific still imports version 1 archives and treats their comments as ordinary comments, and archives written before waits or assignments existed simply have none. An older Lific that only knows version 1 refuses a version 2 archive. Lific reads only the tables and columns it knows about; an archive cannot supply SQL, column names or schema.
+
+Export reads the project in one database transaction while holding the attachment lock, so the archive is a consistent snapshot.
+
+### HTTP routes
+
+| Route | Who | What |
+| --- | --- | --- |
+| `GET /api/project-archives` | Any signed-in user | The web limits, as `max_upload_bytes`, `max_expanded_bytes`, `max_metadata_bytes`, `max_blob_bytes`, `max_blob_total_bytes`, `max_rows` and `max_blobs`, plus `can_import`. |
+| `GET /api/project-archives/{identifier}` | The project's lead, or an administrator | The archive, as `application/gzip` named `<IDENTIFIER>.lific.tar.gz`, with `Cache-Control: no-store`. |
+| `POST /api/project-archives` | An administrator | Imports the archive and answers `201` with the new project and its report. |
+
+- **Access is checked again as the work happens.** The session is re-read inside the export and import transactions, and again before the first byte of a download is sent. Signing out or losing the role in the meantime stops the request.
+- **Upload format.** One `multipart/form-data` request with exactly one field, `archive`. Its filename and content type are ignored, and any other field is refused. The upload is cut off as soon as it passes the size limit, and it has 120 seconds in total and 20 seconds between reads.
+- **Errors.** Exceeding a limit answers `413`. A malformed or unsafe archive answers `400`. Another archive operation already running answers `429`.
+- **Report.** A successful import returns the identifier, row counts per table, the file count, the first 100 unresolved references and `external_reference_count` for the total. The full list is stored with the project and included in its next archive.
+- **Lost connections.** The server finishes an import even if the client disconnects, so a lost response means the result is unknown. Do not retry automatically. Check the project list, and open and verify the project before trusting it; a project with that identifier might have existed before your request.

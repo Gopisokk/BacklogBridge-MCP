@@ -1,0 +1,15 @@
+{
+  "title": "REST API",
+  "pages": [
+    "index",
+    "identity",
+    "projects",
+    "work",
+    "attachments",
+    "sync",
+    "export",
+    "repositories",
+    "public",
+    "oauth"
+  ]
+}

@@ -1,0 +1,569 @@
+---
+title: CLI reference
+description: Every lific command and flag, grouped by what you are trying to do, and how each command reaches your data.
+---
+
+The `lific` binary is the server, the MCP server and the command-line client in one. This page lists every command it accepts. Commands are grouped by task, so to find out how to do something, look for the section that names it: setting up an instance, connecting agents, managing accounts, working with issues, binding repositories, backing up, or diagnosing a problem.
+
+Every command accepts `--help`, and `lific --version` prints the version.
+
+## Global options
+
+These options go before or after the command name and apply to any command that uses them.
+
+```shell
+lific [--config <PATH>] [--db <PATH>] [--json] [--backend sql|http] [--url <URL>] [--api-key <KEY>] <COMMAND>
+```
+
+| Option | What it does |
+| --- | --- |
+| `--config <PATH>` | Uses this configuration file and nothing else. Without it, Lific searches the usual locations; see [Configuration](/docs/configuration#file-discovery). |
+| `--db <PATH>` | Uses this database file instead of `database.path` from the configuration. A relative path resolves against the current directory. |
+| `--json` | Prints JSON. Data commands also print JSON whenever standard output is not a terminal, so a script or agent piping the output gets JSON without asking. |
+| `--backend sql\|http` | Chooses how data commands reach the tracker. `sql`, the default, opens the database file. `http` talks to a running server. See [Local and HTTP backends](#local-and-http-backends). |
+| `--url <URL>` | The server for the HTTP backend. Also read from `LIFIC_URL`. |
+| `--api-key <KEY>` | An API key for the HTTP backend. Also read from `LIFIC_API_KEY`. Help output names the variable but never prints its value. |
+
+## Local and HTTP backends
+
+By default a data command opens the SQLite database directly. It does not need the server to be running, and it acts as the trusted local operator. The database must already exist: only `lific init` creates one, and any other command pointed at a missing file stops and names the path it expected. Run `lific init`, restore a backup, or pass `--config` or `--db` to point at an existing instance.
+
+With `--backend http`, the same commands send REST requests to a running server instead, so you can work with an instance on another machine without its database file:
+
+```shell
+lific --backend http --url https://lific.example.com --api-key "$LIFIC_API_KEY" issue list --project APP
+lific --backend http --url https://lific.example.com --api-key "$LIFIC_API_KEY" issue update APP-42 --status done
+```
+
+The HTTP backend supports `issue`, `project`, `page`, `export`, `search`, `comment`, `module`, `label`, `folder`, `bind` and `git-hook`. Any other command with `--backend http` is refused.
+
+The server URL is `--url` or `LIFIC_URL`, then `server.public_url` from the configuration, then the local bind address. The credential is chosen in this order:
+
+1. `--api-key` or `LIFIC_API_KEY`.
+2. `LIFIC_TOKEN`, but only when `LIFIC_URL` names the same server. A token set for one server is never sent to another; Lific warns and moves on.
+3. The credential stored by [`lific login`](#login-and-logout) for that server, from the OS keyring or the credentials file.
+
+Changes made over HTTP are attributed to the user the credential belongs to, and that user's project permissions apply. That is why `comment add --user` only works with the local backend.
+
+Credentials are only sent to a non-loopback host over HTTPS. A credentials file that is malformed or unsafe stops the lookup rather than being treated as empty.
+
+Both backends print the same output. Issues, projects, pages, plans, modules and comments carry a `web_url` in JSON, and human-readable output turns their identifiers into Markdown links. Over HTTP the link uses the server URL. Locally it uses `server.public_url`, and without one there is no address to link to, so local output has no links.
+
+## Set up and run an instance
+
+### init
+
+Creates an instance, or repairs one that is missing pieces. It writes a configuration file if there is none, creates and migrates the database, and installs Lific as a background service and starts it unless you pass `--no-service`. Running it again on a working instance is safe.
+
+```shell
+lific init [--no-service] [--here] [--name <NAME>] [--auth-mode login-free|passwords] [--password <PASSWORD>]
+```
+
+On a fresh install, meaning no human account exists yet, `init` also creates the first administrator. It asks for a name and for how people should sign in, or takes both from flags:
+
+| Mode | Configuration it writes | First administrator |
+| --- | --- | --- |
+| `login-free` | `[auth] required = false`, `[server] host = "127.0.0.1"`, and browser auto-login turned on | No password. The browser signs you in as this account. |
+| `passwords` | `[auth] required = true`. The bind host is left alone. | The password from `--password`, or prompted for |
+
+The administrator's username comes from the name: lowercased, with each run of characters that are not letters or digits turned into one hyphen. `Ada Lovelace` becomes `ada-lovelace`. If that username is taken, a number is appended.
+
+`init` does not create an API key. Use [`lific connect`](#connect) to give your AI tools keys, or [`lific key create`](#key) to make one yourself.
+
+An instance that already has a human account skips the name and mode questions entirely.
+
+| Flag | What it does |
+| --- | --- |
+| `--no-service` | Creates the configuration and database only. Run `lific start` yourself. Use this in containers and on Linux without a systemd user session. |
+| `--here` | Puts the instance in the current directory as `./lific.toml` and `./lific.db`. Cannot be combined with `--config`. |
+| `--name <NAME>` | The first administrator's name. Required when there is no terminal to ask on. |
+| `--auth-mode <MODE>` | `login-free` or `passwords`, instead of the menu. |
+| `--password <PASSWORD>` | The administrator's password in `passwords` mode. Ignored in `login-free` mode. |
+
+Without `--config` or `--here`, the instance goes in your operating system's standard directories, so `lific` finds it from any working directory. If the current directory already has a `lific.toml`, `init` uses that instead. [Quickstart](/docs/quickstart#where-the-files-go) lists the paths.
+
+With `--db`, a new configuration file records the absolute database path, so later commands find the same database from anywhere. If the configuration already names a different database, `init` warns you: the `--db` path gets seeded, but commands that read only the configuration will use the other one. An existing configuration file can be updated even when its directory is read-only.
+
+### start
+
+Runs the server in the foreground: the web UI, the REST API, the MCP endpoint at `/mcp` and the OAuth routes. While it runs, it also takes automatic backups and empties the trash on schedule.
+
+```shell
+lific start [--port <PORT>] [--host <HOST>] [--init-if-missing]
+```
+
+| Flag | What it does |
+| --- | --- |
+| `-p, --port <PORT>` | Listens on this port instead of `server.port`. |
+| `--host <HOST>` | Binds to this address instead of `server.host`. |
+| `--init-if-missing` | For a container's first boot: creates and migrates the database if it does not exist, instead of refusing to start. |
+
+`--init-if-missing` only creates a database in a location you chose deliberately: an explicit `--config` or `--db`, or a configuration file that was found. The parent directory must already exist and be writable, and `LIFIC_INIT_ADMIN_NAME` and `LIFIC_INIT_ADMIN_PASSWORD` must both be set; they become the first administrator. Once the database exists the flag does nothing, and the existing administrator and settings are kept. See [Self-hosting](/docs/self-hosting#containers).
+
+### service
+
+Manages the background service that `lific init` installs: a systemd user unit on Linux, or a LaunchAgent on macOS. Other platforms have no supported service manager.
+
+```shell
+lific service install
+lific service uninstall
+lific service status
+lific service stop
+lific service restart
+```
+
+| Command | What it does |
+| --- | --- |
+| `install` | Installs the service for the selected configuration and starts it. Running it again rewrites the definition to match the current binary and configuration. |
+| `uninstall` | Stops the service and removes its definition. |
+| `status` | Reports whether the service is installed and running. Exits nonzero when it is missing or stopped. |
+| `stop` | Stops the service but keeps it installed, so it starts again after a reboot. |
+| `restart` | Restarts the service, or starts it if it was stopped. |
+
+### completion
+
+Prints shell completions for `bash`, `zsh`, `fish`, `powershell` or `elvish`. It needs no configuration or database.
+
+```shell
+lific completion fish | source
+lific completion bash > ~/.local/share/bash-completion/completions/lific
+```
+
+## Connect agents
+
+### connect
+
+Adds Lific to your AI tools' MCP configuration. At a terminal it asks how the tools should reach Lific (local stdio is preselected), then which tools to configure; tools found on your machine are already selected. Each selected tool gets its own bot account and API key, named after the tool, so the activity log shows which tool made a change and you can revoke one without touching the others. [Connect agents](/docs/connect) walks through the choices.
+
+```shell
+lific connect [--client <CLIENT>]... [--scope global|project] [--stdio] [--oauth] [--url <URL>] [--key <API_KEY>] [--user <USERNAME>] [--yes] [--dry-run] [--skip-agents]
+```
+
+Known clients are `opencode`, `claude-code`, `claude-desktop`, `cursor`, `vscode`, `codex`, `zed`, `gemini`, `windsurf`, `goose` and `crush`.
+
+Without a terminal, `connect` defaults to the remote transport, and you must name at least one `--client` and pass `--yes`. It also needs an existing Lific database.
+
+| Flag | What it does |
+| --- | --- |
+| `--client <CLIENT>` | Configures this tool. Repeat it for several. |
+| `--scope <SCOPE>` | `global` (the default) writes the tool's user-level configuration. `project` writes the configuration in the current repository. |
+| `--stdio` | Has the tool start `lific --db <PATH> mcp` itself. The tool's key is written into its environment as `LIFIC_TOKEN`. |
+| `--oauth` | Writes a remote entry with no key and lets the tool sign in with OAuth. Creates no bot or key. Tools that cannot do OAuth are skipped with a note. Cannot be combined with `--stdio` or `--key`. |
+| `--url <URL>` | The remote MCP address. Defaults to `server.public_url` plus `/mcp`, or `http://127.0.0.1:<port>/mcp`. |
+| `--key <API_KEY>` | Writes this key for every selected tool instead of creating new ones. |
+| `--user <USERNAME>` | The person who owns the new bots. The bots get that person's project access when membership is enforced. |
+| `--yes` | Skips confirmation prompts. |
+| `--dry-run` | Shows what would be written and creates nothing. |
+| `--skip-agents` | Leaves `./AGENTS.md` alone. Otherwise `connect` adds or updates a Lific section in it. |
+
+### mcp
+
+Runs an MCP server over standard input and output, for a tool that starts Lific itself. Logs go to standard error so they never corrupt the session.
+
+```shell
+lific mcp
+lific mcp --remote --url https://lific.example.com
+lific mcp --instances ~/.config/lific/instances.toml
+```
+
+Plain `lific mcp` opens the local database. The session acts as the user whose key is in `LIFIC_TOKEN`, and the key is checked again before every tool call, so revoking it stops a running session at its next call. Without `LIFIC_TOKEN` the session runs as the operator and prints a warning. A `LIFIC_TOKEN` that is set but invalid stops the launch rather than falling back to operator access.
+
+| Flag | What it does |
+| --- | --- |
+| `--remote` | Forwards the session to one remote server instead of opening a database. Uses the same credentials as the [HTTP backend](#local-and-http-backends). |
+| `--url <URL>` | The server for `--remote`. Also read from `LIFIC_URL`. |
+| `--instances <FILE>` | Forwards to several servers named in a TOML file, each with its own credential. Cannot be combined with `--remote` or a typed `--url`; an exported `LIFIC_URL` is ignored. See [Multiple instances](/docs/mcp/multi-instance). |
+
+When the working directory is a checkout [bound to a project](/docs/repository-bindings), local and remote sessions use that project whenever a tool call leaves `project` out.
+
+### agents-md
+
+Writes a Lific section into an `AGENTS.md` file so agents working in the repository know to use Lific for tracking. It creates the file if needed, and running it again replaces only its own marked section. `lific connect` does this for you unless you pass `--skip-agents`.
+
+```shell
+lific agents-md [--path <PATH>] [--project <PROJECT>]
+```
+
+`--path` chooses the file (default `./AGENTS.md`). `--project` puts that project identifier into the examples; without it the section explains how to find the project. [Git hooks](/docs/git-hooks) covers what the section says and how it fits with the hook.
+
+## Accounts, keys and access
+
+### user
+
+Creates and manages accounts. These commands run against the local database only.
+
+```shell
+lific user create --username <USERNAME> --email <EMAIL> [--password <PASSWORD>] [--admin] [--bot]
+lific user list
+lific user set-password --username <USERNAME> [--password <PASSWORD>]
+lific user promote --username <USERNAME>
+lific user demote --username <USERNAME>
+```
+
+| Flag | What it does |
+| --- | --- |
+| `-u, --username <USERNAME>` | The account. Usernames are unique and case-insensitive. |
+| `-e, --email <EMAIL>` | The account's email address, which must also be unique. |
+| `-p, --password <PASSWORD>` | The password, at least 8 characters. When you leave it out, the command prompts at a terminal or reads one line from standard input. |
+| `--admin` | Makes the new account an instance administrator. |
+| `--bot` | Marks the new account as a bot. |
+
+`promote` makes an account an administrator and `demote` makes it an ordinary user.
+
+`set-password` is the operator's way back into a locked-out account, and it has the same effect as the user changing their own password. In one transaction it sets the password and signs the user out everywhere: every session is deleted, and every API key and OAuth token belonging to the user or to their connected-tool bots is revoked. Keys not bound to a user, other accounts, and the bots themselves are left alone, so the tools stay listed and can be reconnected with `lific connect` or from **Settings**. A running stdio MCP session stops at its next tool call.
+
+### key
+
+Manages API keys. A new key is printed once; Lific keeps only its hash.
+
+```shell
+lific key create --name <NAME> [--user <USERNAME>] [--expires <DATE_OR_DATETIME>]
+lific key assign --name <NAME> --user <USERNAME>
+lific key list
+lific key revoke --name <NAME>
+lific key rotate --name <NAME>
+```
+
+| Flag | What it does |
+| --- | --- |
+| `-n, --name <NAME>` | The key's name, such as `ci` or `laptop`. The other subcommands find the key by this name. |
+| `-u, --user <USERNAME>` | The user the key acts as. |
+| `-e, --expires <DATE_OR_DATETIME>` | An ISO 8601 date (`2026-12-31`) or datetime (`2026-12-31T23:59:59Z`) after which the key stops working. Leave it out for a key that never expires. |
+
+`assign` binds an existing key to a user. `list` shows names and dates, never key values. `revoke` disables a key. `rotate` replaces a key with a new one of the same name and prints the new value once; the old value stops working.
+
+A key with no user acts as the operator and is not limited by project membership. `lific key list` is how you audit those.
+
+### member
+
+Controls which projects a user can see and change when project membership is enforced, which it is by default on instances created with Lific 2.1 or later. A new user sees no projects until you add them. [Projects](/docs/concepts/projects#members-and-roles) explains the roles.
+
+```shell
+lific member list --project <PROJECT>
+lific member add (--project <PROJECT> | --all) --user <USERNAME> [--role viewer|maintainer|lead]
+lific member role --project <PROJECT> --user <USERNAME> --role <ROLE>
+lific member remove --project <PROJECT> --user <USERNAME>
+```
+
+| Flag | What it does |
+| --- | --- |
+| `-p, --project <PROJECT>` | The project identifier. |
+| `-u, --user <USERNAME>` | The user. |
+| `-r, --role <ROLE>` | `viewer`, `maintainer` or `lead`. `member add` defaults to `viewer`. |
+| `--all` | For `member add`: adds the user to every existing project. Projects they already belong to keep their current role. |
+
+### instance
+
+Shows and changes instance-wide settings. These live in the database, not in `lific.toml`, and the web UI's instance settings edit the same values.
+
+```shell
+lific instance info
+lific instance set [--name <NAME>] [--signups <BOOLEAN>] [--signup-domains <DOMAINS>] [--session-days <DAYS>] [--login-message <MESSAGE>] [--auto-login <BOOLEAN>] [--authz-enforced <BOOLEAN>]
+```
+
+`info` prints the settings, the configured server details and user counts. `set` changes only the settings you pass.
+
+| Flag | What it does |
+| --- | --- |
+| `--name <NAME>` | The instance name, up to 60 characters. An empty string clears it and the host name is shown instead. |
+| `--signups <BOOLEAN>` | Opens or closes self-service signup. |
+| `--signup-domains <DOMAINS>` | Comma-separated email domains allowed to sign up, such as `acme.com,sub.acme.com`. An empty string allows any domain. |
+| `--session-days <DAYS>` | How long a browser sign-in lasts, from 1 to 365 days. |
+| `--login-message <MESSAGE>` | A short message on the sign-in screen, up to 280 characters. An empty string clears it. |
+| `--auto-login <BOOLEAN>` | Signs the browser in as the administrator without a login screen. REST and MCP still need credentials. Turning it on is refused when the configuration makes the instance reachable from outside, by the same rule `lific start` applies. Turning it off always works. |
+| `--authz-enforced <BOOLEAN>` | Enforces project membership on every REST and MCP call, reads included. On by default for instances created with 2.1 or later; upgraded instances keep it off until you turn it on. |
+
+### login and logout
+
+Signs the CLI in to a server, for use with `--backend http` and `lific mcp --remote`. `login` uses the OAuth device flow: it prints a web address and a short code, you approve the code in any browser, and the command stores the resulting token in the OS keyring, or in `credentials.json` in the Lific configuration directory (owner-readable only) when there is no keyring.
+
+```shell
+lific login [--url <URL>] [--non-interactive] [--complete <DEVICE_CODE>] [--label <LABEL>] [--no-store]
+lific logout [--url <URL>]
+```
+
+| Flag | What it does |
+| --- | --- |
+| `--url <URL>` | The server. Defaults to `server.public_url`, then `http://127.0.0.1:<port>`. |
+| `--non-interactive` | Prints the code and device code as JSON and exits without waiting. Implied when there is no terminal. Finish later with `--complete`. |
+| `--complete <DEVICE_CODE>` | Waits for an earlier login to be approved, denied or expired, then stores the token. |
+| `--label <LABEL>` | A name shown on the approval page, so you can tell logins apart. |
+| `--no-store` | Prints the token instead of storing it. |
+
+`logout` asks the server to revoke the stored token, then deletes it locally. The local copy is deleted even if the server cannot be reached.
+
+## Projects and work items
+
+These commands work with either [backend](#local-and-http-backends). Identifiers are the ones you see in the web UI: `APP` for a project, `APP-42` for an issue, `APP-DOC-3` for a project page and `DOC-3` for a workspace page.
+
+### project
+
+```shell
+lific project list
+lific project get <IDENTIFIER>
+lific project create --name <NAME> --identifier <IDENTIFIER> [--description <TEXT>]
+lific project update <IDENTIFIER> [--name <NAME>] [--description <TEXT>]
+```
+
+| Flag | What it does |
+| --- | --- |
+| `-n, --name <NAME>` | The project's display name. |
+| `-i, --identifier <IDENTIFIER>` | One to five uppercase letters or digits, starting with a letter. It prefixes every issue number, so `APP` gives `APP-1`. `DOC` is reserved. |
+| `-d, --description <TEXT>` | The project description. Empty by default. |
+
+### issue
+
+```shell
+lific issue list --project <PROJECT> [--status <STATUS>] [--priority <PRIORITY>] [--module <MODULE>] [--label <LABEL>] [--workable] [--assignee <WHO>] [--limit <LIMIT>]
+lific issue get <IDENTIFIER>
+lific issue create --project <PROJECT> --title <TITLE> [--description <MARKDOWN>] [--status <STATUS>] [--priority <PRIORITY>] [--module <MODULE>] [--labels <LABELS>] [--assign <WHO>]
+lific issue update <IDENTIFIER> [--title <TITLE>] [--description <MARKDOWN>] [--status <STATUS>] [--priority <PRIORITY>] [--module <MODULE>] [--labels <LABELS>] [--assign <WHO> | --unassign]
+lific issue link <SOURCE> <TARGET> --type <TYPE>
+lific issue unlink <SOURCE> <TARGET>
+```
+
+`get` prints the issue with its description and relations. `update` changes only the fields you pass. `link` relates two issues; `blocks` and `duplicate` read from source to target, so `lific issue link APP-1 APP-2 --type blocks` means APP-1 blocks APP-2. `unlink` removes every relation between the two issues, whichever direction it runs. Both print the source issue's relations afterwards. [Issues](/docs/concepts/issues) explains what each field does.
+
+| Flag | What it does |
+| --- | --- |
+| `-p, --project <PROJECT>` | The project identifier. |
+| `-t, --title <TITLE>` | A one-line summary. |
+| `-d, --description <MARKDOWN>` | The description. Empty by default. |
+| `-s, --status <STATUS>` | `backlog`, `todo`, `active`, `done` or `cancelled`. New issues default to `backlog`. With `list`, filters by status. |
+| `--priority <PRIORITY>` | `urgent`, `high`, `medium`, `low` or `none`. New issues default to `none`. With `list`, filters by priority. |
+| `-m, --module <MODULE>` | A module name. With `list`, filters by module. |
+| `-l, --label <LABEL>` | For `list`: shows only issues with this label. |
+| `-l, --labels <LABELS>` | For `create` and `update`: comma-separated label names. On `update` the list replaces all of the issue's labels. |
+| `-w, --workable` | For `list`: shows only open issues whose blockers are all `done`. |
+| `--assign <WHO>` | For `create` and `update`: who must do it, comma-separated. `human` for any person, or usernames; `me` is you. On `update` it replaces the assignment. See [Assignment](/docs/concepts/issues#assignment). |
+| `--unassign` | For `update`: clears the assignment so any agent may take the issue. |
+| `--assignee <WHO>` | For `list`: `none` (free for agents), `human` (a person must do it), `me`, or a username. |
+| `--limit <LIMIT>` | For `list`: the most issues to show. 50 by default, at most 500. |
+| `-r, --type <TYPE>` | For `link`: `blocks`, `relates_to` or `duplicate`. |
+
+Filters combine, so `--status todo --label bug` shows issues that match both.
+
+### comment
+
+```shell
+lific comment list <IDENTIFIER> [--limit <LIMIT>] [--offset <OFFSET>] [--order desc|asc]
+lific comment add <IDENTIFIER> --content <MARKDOWN> [--user <USERNAME>]
+```
+
+`list` shows one page of an issue's comments, newest first, and never the whole thread at once. When more comments exist past the page, the last line says which offset to ask for next:
+
+```
+More comments available. Next page: --offset 50
+```
+
+Run `lific comment list APP-42 --offset 50` for the next page, with the same `--order` and `--limit`, or the offsets refer to a different window. JSON output is just the array of comments on the page, so a script has to track the offset itself.
+
+Over HTTP, a full page needs one extra request to learn whether anything follows it. If that request fails, the command still succeeds and says it could not check, rather than implying the thread ended.
+
+| Flag | What it does |
+| --- | --- |
+| `-l, --limit <LIMIT>` | Comments per page. 50 by default; values are clamped to 1 through 500. |
+| `-o, --offset <OFFSET>` | How many comments to skip. 0 by default. |
+| `--order <ORDER>` | `desc` (newest first, the default) or `asc` (oldest first). |
+| `-c, --content <MARKDOWN>` | The comment body. At most 256 KiB. |
+| `-u, --user <USERNAME>` | Who the comment is from. Local backend only. |
+
+Without `--user`, a local comment is written as the first active human administrator, or as the only active human account when there is no administrator. When several non-administrators exist and no administrator, the command asks you to pass `--user`. Over HTTP the author is always the credential's user.
+
+### page
+
+Pages belong to a project, or to the workspace when no project is given.
+
+```shell
+lific page list [--project <PROJECT>] [--folder <FOLDER>] [--label <LABEL>]
+lific page get <IDENTIFIER>
+lific page create --title <TITLE> [--project <PROJECT>] [--folder <FOLDER>] [--content <MARKDOWN>] [--labels <LABELS>]
+lific page update <IDENTIFIER> [--title <TITLE>] [--content <MARKDOWN>] [--folder <FOLDER>] [--labels <LABELS>]
+```
+
+| Flag | What it does |
+| --- | --- |
+| `-p, --project <PROJECT>` | The project. Leave it out for workspace pages. |
+| `-t, --title <TITLE>` | The page title. |
+| `-c, --content <MARKDOWN>` | The page body. Empty by default. |
+| `-f, --folder <FOLDER>` | A folder name. With `list`, filters by folder. With `update`, moves the page. |
+| `-l, --label <LABEL>` | For `list`: shows only pages with this label. |
+| `-l, --labels <LABELS>` | For `create` and `update`: comma-separated label names. On `update` the list replaces all of the page's labels. |
+
+Workspace pages have no folders or labels, so those flags are ignored or refused for them.
+
+### folder, module and label
+
+Folders organize a project's pages. Modules group issues, and labels tag issues and pages. [Modules and labels](/docs/concepts/modules-and-labels) explains the difference. All three are found by name within a project.
+
+```shell
+lific folder list --project <PROJECT>
+lific folder create --project <PROJECT> --name <NAME>
+lific folder update --project <PROJECT> --name <NAME> --new-name <NEW_NAME>
+lific folder delete --project <PROJECT> --name <NAME>
+
+lific module list --project <PROJECT>
+lific module create --project <PROJECT> --name <NAME> [--description <TEXT>] [--status <STATUS>]
+lific module update --project <PROJECT> --name <NAME> [--new-name <NEW_NAME>] [--description <TEXT>] [--status <STATUS>]
+lific module delete --project <PROJECT> --name <NAME>
+
+lific label list --project <PROJECT>
+lific label create --project <PROJECT> --name <NAME> [--color <HEX>]
+lific label update --project <PROJECT> --name <NAME> [--new-name <NEW_NAME>] [--color <HEX>]
+lific label delete --project <PROJECT> --name <NAME>
+```
+
+| Flag | What it does |
+| --- | --- |
+| `-p, --project <PROJECT>` | The project identifier. |
+| `-n, --name <NAME>` | The name of the folder, module or label to create, or of the existing one to change. |
+| `--new-name <NEW_NAME>` | Renames it. |
+| `-d, --description <TEXT>` | A module's description. Empty by default. |
+| `-s, --status <STATUS>` | A module's status: `backlog`, `planned`, `active`, `paused`, `done` or `cancelled`. New modules default to `active`. |
+| `-c, --color <HEX>` | A label's color, such as `#EF4444`. New labels default to `#6B7280`. |
+
+### search
+
+Searches issues, pages and comments.
+
+```shell
+lific search <QUERY> [--project <PROJECT>] [--limit <LIMIT>]
+```
+
+`-p, --project` limits the search to one project. `-l, --limit` sets the number of results: 20 by default, at most 500.
+
+### import
+
+Copies issues from GitHub, Linear or Jira into an existing Lific project. Each imported issue records where it came from, so running the same import again skips issues it already brought over instead of duplicating them. Imported comments are attributed to an import bot owned by a person, so the activity log shows where they came from. `--dry-run` reports what would be imported and writes nothing.
+
+```shell
+lific import github --repo <OWNER/NAME> --project <PROJECT> [--state open|closed|all] [--token <TOKEN>] [--map-open <STATUS>] [--map-closed <STATUS>] [--user <USERNAME>] [--dry-run]
+lific import linear --team <TEAM> --project <PROJECT> [--token <TOKEN>] [--user <USERNAME>] [--dry-run]
+lific import jira --site <SITE> --jira-project <KEY> --project <PROJECT> [--email <EMAIL>] [--token <TOKEN>] [--user <USERNAME>] [--dry-run]
+```
+
+| Flag | What it does |
+| --- | --- |
+| `--project <PROJECT>` | The Lific project that receives the issues. |
+| `--user <USERNAME>` | The person who owns the import bot. When there is exactly one human account or one administrator, it is used; otherwise this flag is required. |
+| `--dry-run` | Reports what would be imported without writing. |
+| `--repo <OWNER/NAME>` | GitHub: the repository, such as `octocat/hello`. Pull requests are skipped. |
+| `--state <STATE>` | GitHub: `open`, `closed` or `all` (the default). |
+| `--token <TOKEN>` | GitHub: a token, or `GITHUB_TOKEN`. Optional for public repositories, but without one GitHub allows only 60 requests an hour. Linear: a personal API key, or `LINEAR_API_KEY`; required. Jira: an API token, or `JIRA_API_TOKEN`; required. |
+| `--map-open <STATUS>` | GitHub: the Lific status for open issues. `backlog` by default. |
+| `--map-closed <STATUS>` | GitHub: the Lific status for closed issues. `done` by default. |
+| `--team <TEAM>` | Linear: the team key, such as `ENG`. |
+| `--site <SITE>` | Jira: the `<site>` part of `<site>.atlassian.net`. |
+| `--jira-project <KEY>` | Jira: the source project key, such as `PROJ`. |
+| `--email <EMAIL>` | Jira: the account email, or `JIRA_EMAIL`; required. |
+
+A GitHub import stops at 10,000 issues or 1,000 comments on one issue. [Limits](/docs/limits) lists the rest.
+
+## Repository bindings and git hooks
+
+### bind
+
+Ties the git repository containing the current directory to a project, so agents and commands working in that checkout use the project without being told. With no project, it reports what the repository is bound to. It works with either backend.
+
+```shell
+lific bind [PROJECT] [--create]
+```
+
+`--create` creates the project first if it does not exist. The binding is keyed on the repository's `origin` remote and its root commit, not on the directory, so another clone of the same repository finds the same project. [Repository bindings](/docs/repository-bindings) covers clones, worktrees, shallow history and conflicts.
+
+### git-hook
+
+Marks issues `done` when commit messages say they are closed: `closes APP-42`, `fixes APP-42` or `resolves APP-42`, in any letter case. A plain mention such as "see APP-42" changes nothing. It works with either backend, so a local hook can write to the database and a CI job can post to a server.
+
+```shell
+lific git-hook [--range <A..B>] [--dry-run]
+```
+
+Without `--range`, it reads one commit message from standard input, which suits a `commit-msg` hook. With `--range`, such as `origin/master..HEAD`, it reads every message in that part of the history, which suits CI or a `post-receive` hook. `--dry-run` reports what would close and changes nothing.
+
+The command installs no hook itself. [Git hooks](/docs/git-hooks) shows the hook and CI setups.
+
+## Backup, restore and export
+
+### dump
+
+Writes one backup archive of the whole instance: a consistent copy of the database, every attachment, and a `manifest.json`. It is safe to run while the server is running. The archive is named after the database file, such as `lific_YYYYMMDD_HHMMSS.tar.gz`, is readable only by its owner, and uses the same format as the automatic backups.
+
+```shell
+lific dump [--out <PATH>]
+```
+
+`--out` names a file, or a directory to write the archive into. By default it goes in the current directory. Point an external backup tool at the output, or run `dump` as its pre-backup step.
+
+### restore
+
+Replaces the instance's data with a `lific dump` archive. Stop the server first: restoring under a running server corrupts its state.
+
+```shell
+lific restore <ARCHIVE> [--force] [--allow-large]
+```
+
+`restore` checks the archive before touching anything: the manifest and database must be present, attachment names must stay inside the attachments directory, and the schema must not be newer than this binary. It unpacks into a temporary directory and moves the result into place, so a failure leaves your current data as it was. Start the server afterwards and any pending migrations run.
+
+| Flag | What it does |
+| --- | --- |
+| `--force` | Allows replacing an existing database. The current one is moved aside to `lific.db.pre-restore-<timestamp>`, not deleted. Without this flag, `restore` refuses when a database exists. |
+| `--allow-large` | Accepts an archive over the default restore limits: a 512 MiB database, 64 MiB for any one attachment, 1 GiB in total, or 10,000 entries. |
+
+The limits exist so an archive from someone else cannot fill your disk before validation rejects it. `lific dump` has no size ceiling, so a large enough instance produces valid backups that exceed them. Pass `--allow-large` only for an archive you made yourself; every other check still runs.
+
+### export issue
+
+Writes one issue, with its comments, as Markdown files in a directory.
+
+```shell
+lific export issue <IDENTIFIER> --output <DIRECTORY>
+```
+
+### export page
+
+Writes one page as Markdown files in a directory.
+
+```shell
+lific export page <IDENTIFIER> --output <DIRECTORY>
+```
+
+### export project
+
+Writes a whole project as Markdown files in a directory. Over HTTP the server sends the project as one ZIP archive and the command unpacks it, so both backends leave the same files in the same places.
+
+```shell
+lific export project <PROJECT> --output <DIRECTORY>
+```
+
+Markdown exports are for reading and for other tools. Lific has no Markdown import, so to move a project to another instance, use a [project archive](#project-archive) instead. Exports have size and count ceilings, listed in [Limits](/docs/limits#exports).
+
+### project-archive
+
+Moves one complete project between Lific databases, including deleted items, history and attachments. Both commands work on local databases only, and both print a JSON report with row and attachment counts and any references that could not be resolved. [Project archives](/docs/project-archives) explains attribution, validation, and the browser workflow for remote instances.
+
+```shell
+lific project-archive export <PROJECT> --out <ARCHIVE>
+lific project-archive import <ARCHIVE> --user <USERNAME>
+```
+
+`export` writes the archive to `--out`, which must not already exist. `import` creates the project as a new, private project in the destination database, and refuses if the identifier is already taken. `--user` names an active human administrator of the destination instance, who becomes the new project's lead.
+
+The CLI allows larger archives than a browser upload does. [Limits](/docs/limits#project-archives) gives both sets of numbers.
+
+## Diagnostics
+
+### doctor
+
+Checks that the instance works: the configuration, the database, backups, the local server, OAuth discovery and a real MCP round trip. When `server.public_url` is set, it checks OAuth discovery there too. Each check reports pass, warn or fail, and the command exits nonzero when anything fails, so scripts and CI can rely on it. Checks that need a running server are skipped, not failed, when nothing is listening.
+
+```shell
+lific doctor [--key <API_KEY>] [--repair]
+```
+
+| Flag | What it does |
+| --- | --- |
+| `--key <API_KEY>` | Uses this key for an authorized MCP check. Also read from `LIFIC_API_KEY`. Without a key, `doctor` still checks that authentication is enforced and discovery is advertised. |
+| `--repair` | Applies pending database migrations while checking. Needs a readable configuration or an explicit `--db`. |
+
+Without `--repair`, `doctor` does not change the database: it runs no migrations and writes no data, although SQLite may still touch its WAL and SHM files. If the configuration cannot be read, `doctor` reports that and skips the checks that depend on it rather than running them against defaults. Pass `--db <PATH>` to inspect a particular database anyway.

@@ -1,0 +1,101 @@
+---
+title: Comments and activity
+description: How comments are identified, linked, mentioned, edited and deleted, how to read a long thread, and what the activity log records.
+---
+
+Comments are the conversation on an issue or page. The activity log is the record of every change, made by anyone, through any interface. Together they answer "what happened here and why" when you come back to a piece of work, or when an agent picks it up in a new session.
+
+## Comments
+
+A comment belongs to exactly one issue or one page, workspace pages included. It holds its author, a Markdown body, and its creation and update times. A comment whose update time differs from its creation time has been edited, and the web UI marks it that way.
+
+A comment written by a connected agent is authored by that agent, not by the person who connected it.
+
+A comment has a kind: `comment`, or `verification` when it holds the evidence an agent gave while closing an issue with `update_issue(status="done", evidence=...)`. MCP output marks these `[verification]`, and the web UI shows a Verification badge, so whoever reviews the close can see what was checked. Otherwise a verification comment behaves like any other: its author can edit or delete it.
+
+### Comment ids and links
+
+Every comment has a numeric id, unique across the instance. Tools that edit or delete a comment take this id, and `get_issue` and `list_comments` show it.
+
+The id is also the comment's anchor: `#comment-7` on its issue or page scrolls to comment 7. In Markdown, `#42` links to comment 42 on the same issue or page, and `APP-25#comment-42` links to a comment on another issue.
+
+### Mentions
+
+Write `@username` to mention someone. A mention starts at `@` after a space, punctuation or the start of the text, followed by letters, digits, underscores and hyphens, so an email address such as `ada@example.com` is not a mention.
+
+Lific resolves mentions when a comment is saved or edited, matching usernames without case and counting each person once. Who can be mentioned depends on [enforcement](/docs/concepts/projects#when-membership-is-enforced): while it is on, only the project's human members; while it is off, any human account. Connected agents cannot be mentioned. A token that matches nobody stays as plain text.
+
+A resolved mention is recorded on the comment, shown as a mention in the web UI, and written to the activity log. Lific sends no email or other notification.
+
+### Limits
+
+A new comment body can be up to 256 KiB. An older comment that is already larger can still be edited, as long as the edit does not make it longer. HTTP requests are separately capped at 2 MiB; the CLI and local stdio MCP work on the database directly and are not subject to that.
+
+A body can mention at most 256 distinct people and reference at most 256 distinct attachments. Past either limit the save is refused with an error that names it, rather than quietly dropping the extra references. The same applies when editing an older comment that is already past a limit: reduce the references before saving.
+
+### Editing and deleting
+
+Only a comment's author or an instance administrator can edit or delete it, and either one still needs to be able to read the issue or page, so a member removed from a project cannot change their old comments there. An edit re-resolves mentions and attachment links from the new body. For a small change, `edit_comment` replaces one exact string, like `edit_issue`.
+
+Deleting a comment moves it to the trash, and it disappears from threads, search and public projects at once. There is no way to restore a single deleted comment. Comments deleted together with their issue or page come back when it is restored; a comment deleted on its own stays in the trash until the [retention sweep](/docs/configuration#retention) removes it.
+
+Anyone who can read an issue or page can comment on it. For a workspace page, while enforcement is on, that means administrators.
+
+## Reading a thread
+
+Interactive reads return at most 500 comments within a 2 MiB budget. Byte limits can shorten any page, so follow continuation instructions rather than assuming a short page ends the thread. Exports use a separate exhaustive query with their own limits. Each surface has its own default:
+
+| Surface | Default page | Default order |
+| --- | --- | --- |
+| `GET /api/issues/{id}/comments`, `GET /api/pages/{id}/comments` | 50 | `asc` (oldest first) |
+| `list_comments` MCP tool | 50 | `desc` (newest first) |
+| `lific comment list` | 50 | `desc` (newest first) |
+| Web UI issue and page detail | 50 | newest page, shown oldest first |
+
+The REST default is `asc` for compatibility, so the default REST page of a long thread is its *oldest* 50 comments and says nothing about the newest one. Ask for `order=desc` to read the current end of a conversation. The MCP tool, the CLI and the web UI all default to newest first for exactly that reason.
+
+Page with `offset`. The MCP tool and the CLI print the offset of the next page when one exists; the web UI offers **Load older comments**.
+
+REST comment lists also accept a keyset cursor (`before_created_at` plus `before_id`) that pages backwards from a comment already seen. An offset drifts under a live thread: one comment posted above a reader shifts every offset by one, so the next page repeats a comment or skips one. The web UI uses the cursor for that reason.
+
+`get_issue` carries a comment trail too, bounded the same way: `recent` (the default) shows the last three, `all` shows the most recent 500, and `none` reports only the count, including when that count is zero. A thread longer than the `all` window says so and points at `list_comments`.
+
+MCP counts rendered links, escaped text and the `get_issue` preamble against its response budget. If a comment cannot fit by itself, the read fails with instructions for continuing; it does not silently skip the comment.
+
+## Activity log
+
+The activity log is an append-only history of changes. It is written by the database itself, so a change is recorded the same way whether it came from the web UI, the CLI, REST, MCP or Lific's own automatic behavior.
+
+Each entry records when it happened, who made the change, which interface it came through, what was changed, the action, and for an update the field with its old and new values. An update that changes three fields writes three entries.
+
+| Transport | Meaning |
+| --- | --- |
+| `web` | A signed-in browser session. |
+| `api` | A REST request with an API key or OAuth token. |
+| `mcp` | An MCP request, over HTTP or stdio. |
+| `cli` | A local CLI command working on the database file. |
+| `system` | No caller, such as a migration. |
+
+Writes by a connected agent are attributed to the agent, not to its owner, and the entry marks the actor as an agent.
+
+### What is recorded
+
+- Projects, including renames, lead changes, publishing and unpublishing, and repository bindings.
+- Membership: members added and removed, and role changes.
+- Modules, labels and folders.
+- Issues, including every field change, label changes and relations.
+- Pages and comments, including mentions.
+- Plans and plan steps, including the automatic changes described in [Plans](/docs/concepts/plans#mirrored-issues), which are recorded as `auto-complete`, `auto-reopen` and `auto-archive`.
+- Deletions and restores.
+
+Uploading or deleting an attachment, saved views, sidebar order and groups, and account and instance settings are not in the activity log.
+
+An entry keeps a readable label such as `APP-42`, and module and folder changes record names rather than ids, so history still reads sensibly after the thing it describes is renamed or gone. Entries remain when the account that made them is removed.
+
+### Reading it
+
+Activity can be read for an issue, a page, a plan or a whole project, newest first, by anyone who can read that thing. Over REST use the `/activity` endpoint under each (`GET /api/issues/{id}/activity`, and likewise for pages, plans and projects); over MCP, `get_activity` takes an issue, page or project identifier. The web UI shows it on each issue and page and in the project's **Activity** view.
+
+### Retention
+
+The log is kept forever by default. To limit it, set `audit_retention_days` in the [`[backup]`](/docs/configuration#backup) section: entries older than that many days are deleted at the end of each automatic backup cycle, so pruning only happens while automatic backups are enabled. Unset or `0` keeps everything.
