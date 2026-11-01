@@ -166,13 +166,6 @@ cargo run -- restore backup_snapshot.tar.gz
 - **Transport**: Model Context Protocol (stdio & HTTP Streamable), WebSockets, Server-Sent Events (SSE)
 - **Database**: Embedded SQLite with WAL mode and atomic transactions
 
----
-
-## 👤 Author & Maintainer
-
-- **Creator & Maintainer**: **Gopi Rk** ([@Gopisokk](https://github.com/Gopisokk))
-- **Email**: `gopi030506@gmail.com`
-- **GitHub**: [https://github.com/Gopisokk/BacklogBridge-MCP](https://github.com/Gopisokk/BacklogBridge-MCP)
 
 ---
 
