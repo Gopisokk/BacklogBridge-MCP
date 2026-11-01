@@ -1,0 +1,500 @@
+name: Release
+
+# Triggered by pushing a version tag (e.g. v1.4.0).
+#
+# The maintainer cuts the tag locally from the version-bump commit and pushes
+# it here. Do NOT have this workflow create tags: keeping tag creation
+# human-driven means a release only ever fires from a deliberate act.
+#
+# Release ritual:
+#   1. bump Cargo.toml, commit, and push the version change (no release yet)
+#   2. `git tag vX.Y.Z && git push origin vX.Y.Z`     (fires this workflow)
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fail fast if the tag and Cargo.toml disagree — otherwise we'd ship a
+  # GitHub release named one version while crates.io publishes another.
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Verify tag matches Cargo.toml version
+        id: v
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
+          echo "tag=${GITHUB_REF_NAME} (version ${TAG_VERSION}), Cargo.toml=${CARGO_VERSION}"
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${CARGO_VERSION}. Bump Cargo.toml to ${TAG_VERSION} (or tag the right commit) before releasing."
+            exit 1
+          fi
+          echo "version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
+      - name: Verify server.json version matches the tag
+        # server.json feeds the MCP Registry publish job (publish-registry
+        # below). The registry is versioned and rejects a re-publish of an
+        # existing version, so a stale server.json would either publish the
+        # WRONG version or get silently rejected on the next release. Assert
+        # both the top-level `version` and packages[0].version equal the tag,
+        # here in verify, so a drifted server.json fails the whole release fast
+        # instead of surfacing at the very last job.
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          TOP_VERSION="$(jq -r '.version' server.json)"
+          PKG_VERSION="$(jq -r '.packages[0].version' server.json)"
+          echo "tag=${TAG_VERSION}, server.json .version=${TOP_VERSION}, .packages[0].version=${PKG_VERSION}"
+          if [ "$TOP_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::server.json .version is '${TOP_VERSION}', expected '${TAG_VERSION}'. Bump server.json's top-level version to ${TAG_VERSION} before releasing."
+            exit 1
+          fi
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::server.json .packages[0].version is '${PKG_VERSION}', expected '${TAG_VERSION}'. Bump it to ${TAG_VERSION} before releasing."
+            exit 1
+          fi
+      - name: Verify CHANGELOG.md has a section for this version
+        # The publish job extracts the TOP `## ` section of CHANGELOG.md as the
+        # GitHub release body. If the changelog wasn't updated before tagging,
+        # that top section is the PREVIOUS release's notes and they get shipped
+        # silently (this is how v1.4.1 went out under v1.4.0's notes — LIF-148).
+        # Assert the newest heading actually names this version, before any
+        # builds run.
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          TOP_HEADING="$(grep -m1 '^## ' CHANGELOG.md || true)"
+          echo "top changelog heading: ${TOP_HEADING}"
+          if ! printf '%s' "$TOP_HEADING" | grep -q "v${VERSION}\b"; then
+            echo "::error::CHANGELOG.md's top section is '${TOP_HEADING}', which does not name v${VERSION}. Add the v${VERSION} section at the top of CHANGELOG.md before tagging."
+            exit 1
+          fi
+
+  test:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: devenv
+      - name: Install devenv
+        shell: bash
+        run: nix profile add "github:cachix/devenv/$(jq -r '.nodes.devenv.locked.rev' devenv.lock)#devenv"
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          cmd-format: devenv shell -- {0}
+          prefix-key: devenv-${{ hashFiles('devenv.lock') }}
+          shared-key: linux-debug
+          save-if: false
+      - name: Run the Devenv project test graph
+        run: devenv test
+
+  build:
+    needs: [verify, test]
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: lific-linux-x86_64
+            profile: release-linux
+            devenv: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: lific-linux-aarch64
+            cross: true
+            file_pattern: "ARM aarch64"
+            profile: release-linux
+            devenv: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: lific-macos-x86_64
+            profile: release-darwin
+            devenv: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: lific-macos-aarch64
+            profile: release-darwin
+            devenv: true
+          # Build the MSVC artifact through the pinned Devenv profile on Linux;
+          # the exact bytes are executed and smoke-tested on Windows below.
+          - target: x86_64-pc-windows-msvc
+            os: ubuntu-latest
+            name: lific-windows-x86_64
+            ext: .exe
+            cross: true
+            file_pattern: "PE32[+]"
+            profile: release-windows-msvc
+            devenv: true
+            verify_on_windows: true
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        if: matrix.devenv
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        if: matrix.devenv
+        with:
+          name: devenv
+      - name: Install devenv
+        if: matrix.devenv
+        shell: bash
+        run: nix profile add "github:cachix/devenv/$(jq -r '.nodes.devenv.locked.rev' devenv.lock)#devenv"
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        if: matrix.devenv
+        with:
+          cmd-format: devenv --profile ${{ matrix.profile }} shell -- {0}
+          prefix-key: devenv-${{ hashFiles('devenv.lock') }}
+          shared-key: release-${{ matrix.target }}
+          save-if: false
+      - name: Build release with devenv
+        shell: bash
+        run: devenv --profile "${{ matrix.profile }}" tasks run "lific:release:${{ matrix.target }}"
+      - name: Rename devenv binary
+        run: cp target/${{ matrix.target }}/dist/lific${{ matrix.ext }} ${{ matrix.name }}${{ matrix.ext }}
+        shell: bash
+
+      - name: Verify artifact exists
+        run: test -s ${{ matrix.name }}${{ matrix.ext }}
+        shell: bash
+
+      - name: Verify macOS artifact has no Nix store dependencies
+        if: matrix.profile == 'release-darwin'
+        shell: bash
+        run: |
+          dependencies="$(otool -L "${{ matrix.name }}")"
+          if [[ "$dependencies" == *"/nix/store/"* ]]; then
+            echo "::error::macOS release binary links to a Nix store library"
+            printf '%s\n' "$dependencies"
+            exit 1
+          fi
+
+      - name: Verify cross artifact structure
+        if: matrix.cross
+        run: |
+          devenv --profile "${{ matrix.profile }}" shell -- bash -euo pipefail -c \
+            "file '${{ matrix.name }}${{ matrix.ext }}' | tee /dev/stderr | grep -q '${{ matrix.file_pattern }}'"
+        shell: bash
+
+      - name: Smoke-test native artifact and embedded web UI
+        if: ${{ matrix.devenv && !matrix.cross }}
+        run: devenv --profile "${{ matrix.profile }}" shell -- bash scripts/verify-release-binary.sh ${{ matrix.name }}${{ matrix.ext }}
+        shell: bash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}${{ matrix.ext }}
+
+      - name: Generate Windows verification checksum
+        if: matrix.verify_on_windows
+        shell: bash
+        run: sha256sum "${{ matrix.name }}${{ matrix.ext }}" > "${{ matrix.name }}${{ matrix.ext }}.sha256"
+
+      - name: Upload Windows verification checksum
+        if: matrix.verify_on_windows
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.name }}-checksum
+          path: ${{ matrix.name }}${{ matrix.ext }}.sha256
+
+  windows-msvc-verify:
+    needs: [verify, build]
+    runs-on: windows-latest
+    steps:
+      # Checkout supplies the same verifier exercised by pull-request CI.
+      # The executable is downloaded from the build matrix, never rebuilt here.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Download Windows executable
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: lific-windows-x86_64
+      - name: Download Windows checksum
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: lific-windows-x86_64-checksum
+      - name: Verify and smoke-test Windows release
+        shell: pwsh
+        run: |
+          ./scripts/verify-release-binary.ps1 -Binary ./lific-windows-x86_64.exe -ChecksumFile ./lific-windows-x86_64.exe.sha256
+
+  release:
+    needs: [verify, build, windows-msvc-verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: binaries
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd binaries
+          sha256sum \
+            lific-linux-x86_64 \
+            lific-linux-aarch64 \
+            lific-macos-x86_64 \
+            lific-macos-aarch64 \
+            lific-windows-x86_64.exe \
+            > sha256sums.txt
+          sha256sum -c sha256sums.txt
+          cat sha256sums.txt
+
+      # Use the curated top section of CHANGELOG.md as the release notes
+      # (accurate, human-written) instead of gh's autogenerated commit list.
+      # Extracts everything between the first "## " heading and the next one.
+      - name: Extract release notes from CHANGELOG
+        run: |
+          awk '/^## /{n++; next} n==1{print}' CHANGELOG.md > RELEASE_NOTES.md
+          echo "----- release notes preview -----"
+          cat RELEASE_NOTES.md
+
+      # The tag already exists (it triggered this run); gh attaches the
+      # release to it. We do NOT create or push a tag here — see the header.
+      # Fall back to --generate-notes if the CHANGELOG section came up empty
+      # (e.g. someone forgot to add the entry), so a release never ships
+      # with no notes at all.
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes_args=(--generate-notes)
+          if [ -s RELEASE_NOTES.md ]; then
+            notes_args=(--notes-file RELEASE_NOTES.md)
+          fi
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            "${notes_args[@]}" \
+            --latest \
+            binaries/lific-linux-x86_64 \
+            binaries/lific-linux-aarch64 \
+            binaries/lific-macos-x86_64 \
+            binaries/lific-macos-aarch64 \
+            binaries/lific-windows-x86_64.exe \
+            binaries/sha256sums.txt
+
+      # Belt-and-suspenders against gh's occasional draft-fallback at create
+      # time. Re-asserts the published state; idempotent.
+      - name: Publish release (force non-draft)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "${GITHUB_REF_NAME}" \
+            --draft=false \
+            --latest
+
+  # Point the Homebrew tap (VoidNullable/homebrew-tap) at this release, so
+  # `brew install voidnullable/tap/lific` and `brew upgrade` pick it up. The
+  # formula installs the binaries the release job just published, pinned to the
+  # hashes in the published sha256sums.txt. See docs/homebrew.md.
+  #
+  # Non-fatal like publish-registry: the release has shipped by now, and a tap
+  # that lags one version is better than a failed release. Without the
+  # HOMEBREW_TAP_DEPLOY_KEY secret the job skips with a notice.
+  homebrew:
+    needs: [verify, release]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+    env:
+      HAS_TAP_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY != '' }}
+      VERSION: ${{ needs.verify.outputs.version }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - name: Skip without a tap deploy key
+        if: env.HAS_TAP_KEY != 'true'
+        run: echo "::notice::HOMEBREW_TAP_DEPLOY_KEY is not set; skipping the Homebrew tap update (see docs/homebrew.md)."
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        if: env.HAS_TAP_KEY == 'true'
+        with:
+          persist-credentials: false
+
+      - name: Render the formula from the published checksums
+        if: env.HAS_TAP_KEY == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --pattern sha256sums.txt
+          bash scripts/render-homebrew-formula.sh "${VERSION}" sha256sums.txt > lific.rb
+          cat lific.rb
+
+      # The deploy key has write access to the tap repository only. Its
+      # credentials must persist so the push step below can use them.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        if: env.HAS_TAP_KEY == 'true'
+        with:
+          repository: VoidNullable/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: tap
+
+      - name: Commit the formula to the tap checkout
+        if: env.HAS_TAP_KEY == 'true'
+        run: |
+          mkdir -p tap/Formula
+          cp lific.rb tap/Formula/lific.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/lific.rb
+          if git diff --cached --quiet; then
+            echo "Formula/lific.rb already matches ${VERSION}."
+          else
+            git commit -m "lific ${VERSION}"
+          fi
+
+      # Install from the local commit before it is pushed, so a formula that
+      # does not install never reaches users.
+      - name: Install and test the formula
+        if: env.HAS_TAP_KEY == 'true'
+        run: |
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew tap voidnullable/tap "${GITHUB_WORKSPACE}/tap"
+          brew install voidnullable/tap/lific
+          brew test voidnullable/tap/lific
+          lific --version | grep -F "lific ${VERSION}"
+
+      - name: Push the formula
+        if: env.HAS_TAP_KEY == 'true'
+        run: git -C tap push origin HEAD
+
+  publish:
+    needs: [verify, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+      - uses: cachix/cachix-action@3ba601ff5bbb07c7220846facfa2cd81eeee15a1 # v16
+        with:
+          name: devenv
+      - name: Install devenv
+        shell: bash
+        run: nix profile add "github:cachix/devenv/$(jq -r '.nodes.devenv.locked.rev' devenv.lock)#devenv"
+      # The Devenv publish task builds web/dist first so the source tarball
+      # contains the embedded UI, then publishes with the locked toolchain.
+      - name: Publish to crates.io through devenv
+        run: devenv tasks run lific:publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Publish server metadata to the official MCP Registry
+  # (registry.modelcontextprotocol.io). See docs/mcp-registry.md for the full
+  # story. This is a THIN, LATE step: the registry stores metadata only and
+  # points at the crate on crates.io, so it must run AFTER `publish` — the crate
+  # (and the `mcp-name:` ownership marker in its README) has to be live before
+  # the registry fetches and validates it.
+  #
+  # This job is deliberately non-fatal: `continue-on-error: true` means a flaky
+  # or slow registry never fails an otherwise-successful release (the binaries
+  # and crates.io publish have already shipped by the time we get here). If the
+  # registry publish fails, re-run it manually per docs/mcp-registry.md.
+  publish-registry:
+    needs: [verify, publish]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      id-token: write # required for `mcp-publisher login github-oidc`
+      contents: read
+    env:
+      # Pin the publisher CLI + its linux/amd64 checksum rather than tracking
+      # releases/latest — reproducibility and supply-chain hygiene (a fetched
+      # `latest` binary is unverifiable at run time). Re-pin VERSION and SHA256
+      # together when bumping; the SHA is the digest of
+      # mcp-publisher_linux_amd64.tar.gz for this release.
+      MCP_PUBLISHER_VERSION: v1.7.9
+      MCP_PUBLISHER_SHA256: ab128162b0616090b47cf245afe0a23f3ef08936fdce19074f5ba0a4469281ac
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install mcp-publisher (pinned + checksum-verified)
+        run: |
+          set -euo pipefail
+          url="https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          curl -fsSL "$url" -o mcp-publisher.tar.gz
+          echo "${MCP_PUBLISHER_SHA256}  mcp-publisher.tar.gz" | sha256sum -c -
+          tar -xzf mcp-publisher.tar.gz mcp-publisher
+          chmod +x mcp-publisher
+          ./mcp-publisher --version || true
+
+      # GitHub OIDC: the `id-token: write` permission above lets mcp-publisher
+      # prove ownership of the io.github.VoidNullable/* namespace from the
+      # workflow's OIDC token — no stored secret or PAT required. The namespace
+      # casing (capital V, N) must match server.json's `name` and the README
+      # marker exactly; the registry's namespace check is case-sensitive
+      # (see docs/mcp-registry.md → "Namespace and casing").
+      - name: Authenticate to MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      # Wait for the just-published crate version to be visible on crates.io
+      # before publishing to the registry. The registry verifies crate
+      # ownership by fetching the crate's README (the `mcp-name:` marker), so
+      # it must be live first. The `publish` job already ran `cargo publish`,
+      # but the crates.io index/CDN takes a few seconds to propagate.
+      - name: Wait for crate version on crates.io
+        run: |
+          set -uo pipefail
+          IDENT="$(jq -r '.packages[0].identifier' server.json)"
+          VERSION="$(jq -r '.packages[0].version' server.json)"
+          echo "Waiting for ${IDENT}@${VERSION} on crates.io..."
+          for i in $(seq 1 24); do   # 24 x 5s = 2 min cap
+            if curl -fsS "https://crates.io/api/v1/crates/${IDENT}/${VERSION}" >/dev/null 2>&1; then
+              echo "Found ${IDENT}@${VERSION}"
+              exit 0
+            fi
+            echo "  attempt ${i}: not visible yet, sleeping 5s"
+            sleep 5
+          done
+          echo "::warning::${IDENT}@${VERSION} still not visible on crates.io after 2 min; attempting registry publish anyway."
+
+      # Publish server.json to the registry. Retry to absorb crates.io
+      # propagation lag on the ownership check, but fail fast on a deterministic
+      # 422 validation rejection (a bad server.json — retrying just burns time).
+      - name: Publish to MCP Registry
+        run: |
+          set -uo pipefail
+          for i in $(seq 1 10); do
+            if out="$(./mcp-publisher publish 2>&1)"; then
+              echo "$out"
+              echo "Published to the MCP Registry."
+              exit 0
+            fi
+            echo "$out"
+            if printf '%s' "$out" | grep -qiE '422|validation'; then
+              echo "::error::MCP Registry rejected server.json (validation error) — fix server.json; retrying won't help."
+              exit 1
+            fi
+            echo "::warning::publish attempt ${i} failed (registry flaky or crate not yet propagated); waiting 15s"
+            sleep 15
+          done
+          echo "::error::MCP Registry publish did not succeed after retries."
+          exit 1

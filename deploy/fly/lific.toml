@@ -1,0 +1,44 @@
+# Lific configuration for the community instance on Fly.io. Injected into the
+# machine at /etc/lific/lific.toml by the [[files]] entry in fly.toml. The
+# database and backups live on the persistent volume mounted at /data.
+
+[server]
+host = "0.0.0.0"
+port = 3456
+# Browsers reach this instance through the community.lific.dev Cloudflare
+# Worker, which proxies to the .fly.dev origin. The public URL is the address
+# people see, so OAuth metadata, MCP links and cookies name it. Both origins
+# are allowed because the .fly.dev address still answers directly.
+public_url = "https://community.lific.dev"
+cors_origins = ["https://community.lific.dev", "https://lific-community.fly.dev"]
+# Fly Proxy is the only direct peer of this port. The community Worker sends
+# the original client in an authenticated header using the shared
+# LIFIC_TRUSTED_PROXY_SECRET environment secret. Direct .fly.dev requests lack
+# that secret and still resolve through Fly's appended X-Forwarded-For chain.
+# The last two entries are this app's anycast addresses.
+trusted_proxies = [
+  "fdaa::/16",
+  "172.16.0.0/12",
+  "127.0.0.1/32",
+  "::1/128",
+  "66.241.125.147/32",
+  "2a09:8280:1::186:a77a:0/128",
+]
+
+[database]
+path = "/data/lific.db"
+
+[backup]
+enabled = true
+dir = "/data/backups"
+interval_minutes = 60
+retain = 24
+
+[log]
+level = "info"
+
+[auth]
+# Accounts are created by the operator. The public issue view is the only
+# anonymous surface; nobody self-registers on the community tracker.
+allow_signup = false
+required = true
