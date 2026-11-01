@@ -1,0 +1,2318 @@
+//! LIF-249: `lific connect` — write MCP config into AI clients from the CLI.
+//!
+//! The flagship onboarding command. It replaces the copy-a-snippet web page as
+//! the primary path: pick clients (interactively or via `--client`), mint (or
+//! reuse) an API key, and write correct MCP config directly into each client's
+//! native config file — merging non-destructively.
+//!
+//! Structure:
+//! - [`clients`] — the canonical server config + per-client schema/path matrix.
+//! - [`writer`]  — format-native, merge-preserving JSON/TOML/YAML writers.
+//! - this module — orchestration: CLI args → detection → key minting → writes →
+//!   output, plus the optional AGENTS.md step (LIF-251).
+//!
+//! ## Key-minting & authz semantics (investigated, LIF-249)
+//!
+//! An API key with `user_id = NULL` (an "unassigned" key) behaves very
+//! differently under the two authz modes (see `src/authz.rs`):
+//! - **Legacy mode (default, `authz_enforced = false`):** an unassigned key
+//!   resolves to `AuthUser = None`, which `require_role` passes unconditionally
+//!   at Viewer/Maintainer. It can read and write everything — exactly like
+//!   `lific start`'s first-run "default" key. Fine for a local single-user box.
+//! - **Enforced mode (`authz_enforced = true`):** `None` is default-denied at
+//!   every level and `visible_project_ids` returns the empty set — an
+//!   unassigned key would **see nothing**. Shipping one there is a setup bug.
+//!
+//! Therefore `connect` prefers a **bot identity owned by a human** (parity with
+//! the web UI's Connected Tools): the bot inherits its owner's role, so it works
+//! under both modes. It only falls back to a plain unassigned key on a truly
+//! fresh install (zero human users) — where enforcement can't be on yet (it
+//! takes an admin to enable). If humans exist but none can be chosen
+//! unambiguously and no `--user` was given, we surface guidance rather than mint
+//! a key that might see nothing.
+//!
+//! **Per-tool identities (LIF-259).** `connect` mints ONE bot + key PER SELECTED
+//! CLIENT, named after the tool the way the web UI's Connected Tools page does
+//! (`{tool}-{owner.username}`, e.g. `opencode-blake`). This means the audit log
+//! attributes each change to the specific harness ("OpenCode changed status"),
+//! and CLI-connected tools show up on that page indistinguishable from
+//! web-connected ones. On a fresh install (zero human users) it mints one plain
+//! unassigned key per tool named just `{tool}` — still per-tool attribution in
+//! the key name even without a human owner. `--key <k>` uses that one key
+//! verbatim for every client (no minting); `--dry-run` uses a placeholder.
+//!
+//! **`--oauth` mode (LIF-259).** Writes the remote config WITHOUT any
+//! `Authorization` header (URL only) so the client's native MCP OAuth flow takes
+//! over. Mints nothing — no bot, no key. Only OAuth-capable clients are written;
+//! the rest are surfaced as skipped outcomes with an explanatory note. Conflicts
+//! with `--stdio` and `--key`.
+
+pub mod clients;
+pub mod writer;
+
+use std::io::IsTerminal;
+use std::path::PathBuf;
+
+use rusqlite::OptionalExtension;
+
+use crate::config::Config;
+use crate::db::DbPool;
+
+use clients::{ClientSpec, OauthSupport, Os, PathBase, Scope, ServerConfig};
+
+/// Parsed, validated arguments for a `connect` run. Built from the CLI enum in
+/// `cli/mod.rs` so the heavy lifting here is testable without clap.
+#[derive(Debug, Clone)]
+pub struct ConnectArgs {
+    pub clients: Vec<String>,
+    pub scope: Scope,
+    pub stdio: bool,
+    /// Write header-less remote config and let the client's native MCP OAuth
+    /// flow authenticate. Mints nothing. Conflicts with `--stdio`/`--key`.
+    pub oauth: bool,
+    pub url: Option<String>,
+    pub key: Option<String>,
+    pub user: Option<String>,
+    pub yes: bool,
+    pub dry_run: bool,
+    pub skip_agents: bool,
+}
+
+/// The transport a `lific connect` run uses, resolved once from flags or the
+/// interactive menu. Both paths funnel through [`resolve_transport_inner`] so
+/// the interactive and flag-driven runs can never diverge (LIFIC-19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportMode {
+    /// Local stdio: spawn `lific --db <path> mcp` (agent token LIFIC-18).
+    Stdio,
+    /// Streamable-HTTP remote with a bearer API key.
+    Remote,
+    /// Header-less remote driving the client's native MCP OAuth flow.
+    Oauth,
+}
+
+/// The outcome for a single client write, for both human and JSON output.
+#[derive(Debug, Default)]
+pub struct ClientOutcome {
+    pub id: String,
+    pub display: String,
+    pub format: String,
+    pub path: Option<PathBuf>,
+    pub action: Option<String>,
+    pub notes: Vec<String>,
+    pub error: Option<String>,
+    pub manual_snippet: Option<String>,
+    /// The full file body, for `--dry-run` display.
+    pub dry_run_contents: Option<String>,
+    /// The API key written into THIS client's config (LIF-259 per-tool keys).
+    /// `None` for stdio, `--oauth`, and skipped clients.
+    pub key: Option<String>,
+    /// The post-connect auth command to run for this client under `--oauth`.
+    pub auth_hint: Option<String>,
+}
+
+/// How this run's per-tool keys were obtained (all share one origin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyOrigin {
+    /// Supplied by the user via `--key`.
+    Provided,
+    /// Minted as a bot identity owned by a human user.
+    Bot,
+    /// Minted as a plain unassigned key (fresh install, zero users).
+    Unassigned,
+}
+
+/// The full result of a run, returned so `main` (and tests) can render it.
+///
+/// Per-client keys now live on each [`ClientOutcome::key`] (LIF-259). The
+/// run-level `key_origin` records how those keys were obtained (all clients in a
+/// run share the same origin: provided / bot / unassigned).
+#[derive(Debug)]
+pub struct ConnectResult {
+    pub outcomes: Vec<ClientOutcome>,
+    pub key_origin: Option<KeyOrigin>,
+    pub agents_md: Option<AgentsMdOutcome>,
+    pub dry_run: bool,
+    pub stdio: bool,
+    /// True when this run wrote header-less OAuth configs (`--oauth`).
+    pub oauth: bool,
+    pub url: String,
+    /// The resolved transport (LIFIC-19), so interactive and flag runs report
+    /// the same choice.
+    pub transport: TransportMode,
+}
+
+#[derive(Debug)]
+pub struct AgentsMdOutcome {
+    pub path: PathBuf,
+    pub action: String,
+}
+
+/// The URL (or db path, for `--stdio`) this run will write into client
+/// configs. Shared by `run` and by the pre-run announcement so they can never
+/// disagree.
+pub fn target_url(args: &ConnectArgs, cfg: &Config) -> String {
+    if args.stdio {
+        absolute_db_path(cfg)
+    } else {
+        args.url.clone().unwrap_or_else(|| default_url(cfg))
+    }
+}
+
+/// Guard: refuse to run against an instance that doesn't exist yet.
+///
+/// Without this, `lific connect` in any random directory would silently
+/// CREATE a fresh `lific.db` there and mint keys against it — wiring every
+/// selected client to a brand-new empty instance the user never asked for
+/// (and, worse, silently *replacing* their existing client config pointing at
+/// the real one). Explicit `--db`/`--config`/cwd discovery must resolve to a
+/// database that already exists; `lific init` is the thing that creates one.
+pub fn ensure_instance_exists(cfg: &Config) -> Result<(), String> {
+    let db = &cfg.database.path;
+    if db.exists() {
+        return Ok(());
+    }
+    Err(format!(
+        "no Lific instance here: {} does not exist. Run `lific connect` from your instance's \
+         directory (where lific.toml/lific.db live), point at it with --config or --db, or \
+         create one first with `lific init`.",
+        absolute_db_path(cfg)
+    ))
+}
+
+/// Build the production [`PathBase`] from the real environment.
+///
+/// A `LIFIC_CONNECT_HOME` override is honored for the home dir. It exists for
+/// smoke-testing so a manual run can be pointed at a scratch dir instead of the
+/// operator's real `~/.config` — documented as test-only.
+pub fn production_base() -> Result<PathBase, String> {
+    let home = std::env::var_os("LIFIC_CONNECT_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| "could not determine home directory".to_string())?;
+    let project = std::env::current_dir().map_err(|e| format!("cannot read cwd: {e}"))?;
+    let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+    Ok(PathBase {
+        home,
+        project,
+        os: Os::host(),
+        appdata,
+    })
+}
+
+/// Compute the default MCP URL for remote configs.
+///
+/// Prefer `server.public_url` (with `/mcp` appended if it isn't already there).
+/// Otherwise `http://127.0.0.1:{port}/mcp` — never `0.0.0.0`, which is a bind
+/// address, not something a client can dial.
+pub fn default_url(cfg: &Config) -> String {
+    if let Some(pu) = cfg.server.public_url.as_deref() {
+        let trimmed = pu.trim().trim_end_matches('/');
+        if trimmed.ends_with("/mcp") {
+            return trimmed.to_string();
+        }
+        return format!("{trimmed}/mcp");
+    }
+    format!("http://127.0.0.1:{}/mcp", cfg.server.port)
+}
+
+/// Absolute DB path for stdio configs (canonicalized when the file exists, else
+/// made absolute against cwd so the spawned server opens the right file).
+pub fn absolute_db_path(cfg: &Config) -> String {
+    cfg.absolute_database_path()
+}
+
+/// Build the canonical [`ServerConfig`] for one client. `key` is that client's
+/// own credential. For a remote transport it's the bearer API key; for stdio
+/// (LIFIC-18) it's the agent token written into the client config's env field
+/// as `LIFIC_TOKEN`. Ignored for oauth transports.
+fn build_server_config(args: &ConnectArgs, cfg: &Config, key: &str) -> ServerConfig {
+    if args.stdio {
+        // An empty key (no agent identity) yields a plain operator stdio config.
+        if key.is_empty() {
+            ServerConfig::stdio(absolute_db_path(cfg))
+        } else {
+            ServerConfig::stdio_with_token(absolute_db_path(cfg), key)
+        }
+    } else if args.oauth {
+        let url = args.url.clone().unwrap_or_else(|| default_url(cfg));
+        ServerConfig::oauth_remote(url)
+    } else {
+        let url = args.url.clone().unwrap_or_else(|| default_url(cfg));
+        ServerConfig::remote(url, key)
+    }
+}
+
+// ── Client selection ─────────────────────────────────────────
+
+/// Resolve the list of client ids to write. Explicit `--client` wins (each is
+/// validated). With none given and a TTY, run the interactive picker. With none
+/// and no TTY, refuse — naming the flags a non-interactive caller must pass.
+///
+/// Factored to take an injected `stdin_tty` and a picker closure so the refusal
+/// branch is unit-testable (mirrors `term::confirm_inner`).
+pub fn resolve_clients_inner(
+    requested: &[String],
+    stdin_tty: bool,
+    base: &PathBase,
+    scope: Scope,
+    picker: impl FnOnce(&[DetectedClient]) -> Result<Vec<String>, String>,
+) -> Result<Vec<String>, String> {
+    if !requested.is_empty() {
+        for id in requested {
+            if clients::find_client(id).is_none() {
+                return Err(format!(
+                    "unknown client '{id}'. Known clients: {}",
+                    clients::all_client_ids().join(", ")
+                ));
+            }
+        }
+        // De-dup while preserving order.
+        let mut seen = std::collections::HashSet::new();
+        return Ok(requested
+            .iter()
+            .filter(|id| seen.insert((*id).clone()))
+            .cloned()
+            .collect());
+    }
+
+    if !stdin_tty {
+        return Err(format!(
+            "no client selected and stdin is not a TTY. Pass --client <id> (repeatable) to choose \
+             clients, and --yes to skip prompts. Known clients: {}",
+            clients::all_client_ids().join(", ")
+        ));
+    }
+
+    let detected = detect_clients(base, scope);
+    picker(&detected)
+}
+
+/// A client and whether it was detected in the given scope.
+#[derive(Debug, Clone)]
+pub struct DetectedClient {
+    pub id: String,
+    pub display: String,
+    pub detected: bool,
+}
+
+/// Probe the filesystem for every client's config presence in `scope`.
+pub fn detect_clients(base: &PathBase, scope: Scope) -> Vec<DetectedClient> {
+    clients::all_clients()
+        .iter()
+        .map(|c| DetectedClient {
+            id: c.id.to_string(),
+            display: c.display.to_string(),
+            detected: c.detected(base, scope),
+        })
+        .collect()
+}
+
+/// The default interactive picker: a real arrow-key multiselect (space to
+/// toggle, enter to confirm). Detected clients are listed first and
+/// preselected; the rest follow so an undetected client can still be chosen.
+/// The prompt names the target instance so it's impossible to wire clients to
+/// the wrong one without noticing.
+fn interactive_picker(detected: &[DetectedClient], target: &str) -> Result<Vec<String>, String> {
+    let any_installed = detected.iter().any(|c| c.detected);
+    let mut ordered: Vec<&DetectedClient> = detected.iter().filter(|c| c.detected).collect();
+    ordered.extend(detected.iter().filter(|c| !c.detected));
+
+    let mut prompt = cliclack::multiselect(if any_installed {
+        format!("Which clients should connect to {target}?")
+    } else {
+        format!("No installed clients detected in this scope — pick any to configure for {target}:")
+    })
+    .required(true);
+    for c in &ordered {
+        prompt = prompt.item(
+            c.id.clone(),
+            &c.display,
+            if c.detected { "detected" } else { "" },
+        );
+    }
+    let initial: Vec<String> = ordered
+        .iter()
+        .filter(|c| c.detected)
+        .map(|c| c.id.clone())
+        .collect();
+    if !initial.is_empty() {
+        prompt = prompt.initial_values(initial);
+    }
+    prompt.interact().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            "cancelled".to_string()
+        } else {
+            format!("selection failed: {e}")
+        }
+    })
+}
+
+// ── Transport selection (LIFIC-19) ───────────────────────────
+
+/// Resolve the transport for a run. The flags win when present (non-interactive
+/// path, unchanged). With neither `--stdio` nor `--oauth`, an interactive TTY
+/// gets a visible transport menu with stdio preselected; a non-TTY falls back
+/// to the remote default (the historical behavior).
+///
+/// Factored to take an injected `stdin_tty` and a picker closure so the
+/// flag/NON-tty branches are unit-testable (mirrors `resolve_clients_inner`).
+pub fn resolve_transport_inner(
+    stdio: bool,
+    oauth: bool,
+    stdin_tty: bool,
+    picker: impl FnOnce() -> Result<TransportMode, String>,
+) -> Result<TransportMode, String> {
+    if stdio {
+        return Ok(TransportMode::Stdio);
+    }
+    if oauth {
+        return Ok(TransportMode::Oauth);
+    }
+    if stdin_tty {
+        picker()
+    } else {
+        // No transport flag and not interactive → remote, the standing default.
+        Ok(TransportMode::Remote)
+    }
+}
+
+/// The interactive transport menu: stdio preselected, with remote and OAuth
+/// available. Does not prompt for a URL — the target URL is a server-config
+/// fact derived upstream (LIFIC-19 AC: never a connect-time prompt).
+fn interactive_transport_picker() -> Result<TransportMode, String> {
+    let mut prompt = cliclack::Select::new("How should clients connect to this Lific instance?");
+    prompt = prompt
+        .item(
+            TransportMode::Stdio,
+            "Local stdio",
+            "spawn lific --db <path> mcp; the agent carries its own token",
+        )
+        .item(
+            TransportMode::Remote,
+            "Remote (API key)",
+            "reach the running server over HTTP with a bearer key",
+        )
+        .item(
+            TransportMode::Oauth,
+            "OAuth",
+            "header-less config; the client authenticates via its native MCP OAuth flow",
+        )
+        .initial_value(TransportMode::Stdio);
+    prompt.interact().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            "cancelled".to_string()
+        } else {
+            format!("transport selection failed: {e}")
+        }
+    })
+}
+
+/// The CLI-shown label for a resolved transport (used in the run announcement
+/// and JSON output) so both paths name the same thing.
+impl TransportMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TransportMode::Stdio => "stdio",
+            TransportMode::Remote => "remote",
+            TransportMode::Oauth => "oauth",
+        }
+    }
+}
+
+// ── Key minting ──────────────────────────────────────────────
+
+/// How this run mints per-tool keys, resolved once up front (owner selection is
+/// a run-wide decision) and then applied per selected client.
+#[derive(Debug)]
+enum KeySource {
+    /// `--key <k>`: use this verbatim for every client, mint nothing.
+    Provided(String),
+    /// Humans exist: mint a bot `{tool}-{owner}` owned by `owner_id` per tool.
+    Bot { owner_id: i64 },
+    /// Fresh install (zero humans): mint a plain unassigned key named `{tool}`.
+    FreshInstall,
+}
+
+impl KeySource {
+    fn origin(&self) -> KeyOrigin {
+        match self {
+            KeySource::Provided(_) => KeyOrigin::Provided,
+            KeySource::Bot { .. } => KeyOrigin::Bot,
+            KeySource::FreshInstall => KeyOrigin::Unassigned,
+        }
+    }
+}
+
+/// Resolve the run-wide key source: `--key` short-circuits; otherwise pick an
+/// owner (explicit `--user`, the sole human, or the sole admin — else require
+/// `--user`). See the module docs for the authz rationale.
+fn resolve_key_source(args: &ConnectArgs, pool: &DbPool) -> Result<KeySource, String> {
+    if let Some(k) = &args.key {
+        return Ok(KeySource::Provided(k.clone()));
+    }
+    match choose_owner(pool, args.user.as_deref())? {
+        OwnerChoice::User(owner_id) => Ok(KeySource::Bot { owner_id }),
+        OwnerChoice::FreshInstall => Ok(KeySource::FreshInstall),
+    }
+}
+
+/// Mint (or rotate) the key for one specific tool under `source`.
+///
+/// - **Bot:** find-or-create the bot `{tool}-{owner}` (web-UI convention), with
+///   the tool's display name, mint-or-rotate a key named after the bot, and
+///   assign the key to the bot. The bot's `owner_id` points at the human, so
+///   authz resolves bot → owner (src/authz.rs).
+/// - **FreshInstall:** mint-or-rotate a plain unassigned key named just `{tool}`.
+/// - **Provided:** the verbatim `--key` (no DB writes).
+///
+/// Returns the plaintext key for that tool.
+fn mint_for_tool(source: &KeySource, spec: &ClientSpec, pool: &DbPool) -> Result<String, String> {
+    match source {
+        KeySource::Provided(k) => Ok(k.clone()),
+        KeySource::Bot { owner_id } => {
+            // Bot username = `{tool}-{owner.username}`, matching the web UI's
+            // Connected Tools (src/api/auth.rs create_bot) so a CLI-connected
+            // bot is indistinguishable from a web-connected one.
+            let owner_username = {
+                let conn = pool.read().map_err(|e| e.to_string())?;
+                crate::db::queries::users::get_user_by_id(&conn, *owner_id)
+                    .map_err(|e| e.to_string())?
+                    .username
+            };
+            let bot_username = format!("{}-{}", spec.id, owner_username);
+            let bot_id = {
+                let conn = pool.write().map_err(|e| e.to_string())?;
+                crate::db::queries::users::ensure_bot(&conn, *owner_id, spec.id, spec.display)
+                    .map_err(|e| e.to_string())?
+                    .id
+            };
+            // LIF-391: the key is bound to the bot as it is minted, never
+            // created unbound and patched afterwards.
+            mint_or_rotate(pool, &bot_username, Some(bot_id))
+        }
+        KeySource::FreshInstall => {
+            // Zero human users: enforcement can't be on (needs an admin to
+            // enable), so a plain unassigned key behaves like `lific start`'s
+            // first-run default key. Named just `{tool}` — per-tool attribution
+            // in the key name even without a human owner.
+            mint_or_rotate(pool, spec.id, None)
+        }
+    }
+}
+
+/// Create a key named `name`, or — if an active key with that name already
+/// exists (a previous `connect` run) — rotate it instead so re-running
+/// `connect` (e.g. to add another client later) always succeeds with a fresh
+/// plaintext. `user_id` is the owner the key is bound to; `None` mints an
+/// unbound key and, on the rotate path, preserves any existing binding.
+fn mint_or_rotate(pool: &DbPool, name: &str, user_id: Option<i64>) -> Result<String, String> {
+    let existing_key = {
+        let conn = pool.read().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT revoked, expires_at IS NOT NULL
+                 AND (datetime(expires_at) IS NULL OR datetime(expires_at) <= datetime('now'))
+             FROM api_keys WHERE name = ?1",
+            rusqlite::params![name],
+            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .optional()
+        .map_err(|e| format!("failed to inspect API key '{name}': {e}"))?
+    };
+
+    match existing_key {
+        Some((false, true)) => Err(format!(
+            "API key '{name}' has expired or an invalid expiry and cannot be rotated implicitly. \
+             Revoke it with `lific key revoke --name '{name}'`, then rerun `lific connect` to \
+             issue a replacement."
+        )),
+        Some((false, false)) => {
+            crate::auth::rotate_api_key_bound(pool, name, user_id).map_err(|e| e.to_string())
+        }
+        Some((true, _)) | None => {
+            crate::auth::create_api_key(pool, name, user_id).map_err(|e| e.to_string())
+        }
+    }
+}
+
+enum OwnerChoice {
+    User(i64),
+    FreshInstall,
+}
+
+fn choose_owner(pool: &DbPool, requested_user: Option<&str>) -> Result<OwnerChoice, String> {
+    let conn = pool.read().map_err(|e| e.to_string())?;
+
+    if let Some(username) = requested_user {
+        let u = crate::db::queries::users::get_user_by_username(&conn, username)
+            .map_err(|_| format!("user '{username}' not found"))?;
+        return Ok(OwnerChoice::User(u.id));
+    }
+
+    let users = crate::db::queries::users::list_users(&conn).map_err(|e| e.to_string())?;
+    let humans: Vec<_> = users.iter().filter(|u| !u.is_bot).collect();
+
+    match humans.len() {
+        0 => Ok(OwnerChoice::FreshInstall),
+        1 => Ok(OwnerChoice::User(humans[0].id)),
+        _ => {
+            // Prefer a single admin if there's exactly one; otherwise require
+            // an explicit choice rather than guessing (and risk a key that sees
+            // nothing under enforcement, or is owned by the wrong person).
+            let admins: Vec<_> = humans.iter().filter(|u| u.is_admin).collect();
+            if admins.len() == 1 {
+                Ok(OwnerChoice::User(admins[0].id))
+            } else {
+                Err(
+                    "multiple users exist — pass --user <username> to choose which user owns the \
+                     connection's API key (it inherits that user's project access)."
+                        .into(),
+                )
+            }
+        }
+    }
+}
+
+// ── The run ──────────────────────────────────────────────────
+
+/// Execute a `connect` run: select clients, then per client mint/reuse its own
+/// key (LIF-259) and render or write its config; finally (optionally) update
+/// AGENTS.md. Pure enough to test end-to-end against a temp base + in-memory DB.
+pub fn run(
+    args: &ConnectArgs,
+    cfg: &Config,
+    pool: &DbPool,
+    base: &PathBase,
+) -> Result<ConnectResult, String> {
+    // Flag conflicts: --oauth mints nothing and writes header-less config, so a
+    // stdio transport or an explicit key make no sense together with it.
+    if args.oauth && args.stdio {
+        return Err(
+            "--oauth and --stdio are mutually exclusive: --oauth writes a header-less remote \
+             config for the client's native OAuth flow, while --stdio writes a local spawn with \
+             no network auth at all."
+                .into(),
+        );
+    }
+    if args.oauth && args.key.is_some() {
+        return Err(
+            "--oauth and --key are mutually exclusive: --oauth writes no key (the client \
+             obtains its own token via OAuth), so passing --key contradicts it."
+                .into(),
+        );
+    }
+
+    let stdin_tty = std::io::stdin().is_terminal();
+
+    // LIFIC-19: resolve the transport — flags win (non-interactive path, the
+    // scripted equivalent); an interactive TTY with neither flag gets a visible
+    // menu with stdio preselected. Resolving into the same `ConnectArgs` the
+    // flag path would have produced guarantees the two can never diverge.
+    let transport = resolve_transport_inner(args.stdio, args.oauth, stdin_tty, || {
+        interactive_transport_picker()
+    })?;
+    let mut args = args.clone();
+    match transport {
+        TransportMode::Stdio => {
+            args.stdio = true;
+            args.oauth = false;
+        }
+        TransportMode::Remote => {
+            args.stdio = false;
+            args.oauth = false;
+        }
+        TransportMode::Oauth => {
+            args.stdio = false;
+            args.oauth = true;
+        }
+    }
+
+    let target = target_url(&args, cfg);
+    let selected = resolve_clients_inner(&args.clients, stdin_tty, base, args.scope, |d| {
+        interactive_picker(d, &target)
+    })?;
+
+    // Resolve how per-tool credentials are minted (once — owner selection is
+    // run-wide). Both remote and stdio (LIFIC-18) mint a bot + key per tool;
+    // for stdio the key becomes the `LIFIC_TOKEN` written into the client's
+    // env field. `--oauth` mints nothing, and dry-run is skipped so a preview
+    // never touches the DB.
+    let needs_minting = !args.oauth && !args.dry_run;
+    let key_source = if needs_minting {
+        // For stdio (LIFIC-18), a bot+key is optional: if the owner can't be
+        // resolved unambiguously (no --user on a multi-user box), degrade to a
+        // plain operator stdio config rather than aborting the run — a stdio
+        // session with no token already runs as the operator. Remote still
+        // hard-fails: a remote config without a key is genuinely misconfigured.
+        match resolve_key_source(&args, pool) {
+            Ok(src) => Some(src),
+            Err(e) if args.stdio => {
+                eprintln!(
+                    "warning: skipping agent identity for stdio config ({e}); \
+                     it will run as the operator until you reconnect with --user <name>."
+                );
+                None
+            }
+            Err(e) => return Err(e),
+        }
+    } else if args.dry_run && !args.oauth {
+        // Dry-run still reports an origin so output matches a real run's shape.
+        Some(KeySource::Provided(
+            "lific_sk-live-DRYRUN000000000000000000000000".to_string(),
+        ))
+    } else {
+        None
+    };
+    let key_origin = key_source.as_ref().map(|s| s.origin());
+
+    let outcomes = write_all_clients(&selected, &args, cfg, pool, base, key_source.as_ref());
+
+    // AGENTS.md (LIF-251).
+    let agents_md = maybe_write_agents_md(&args, base, stdin_tty)?;
+
+    // A representative URL/db-path for the run-level summary.
+    let url = if args.stdio {
+        absolute_db_path(cfg)
+    } else {
+        args.url.clone().unwrap_or_else(|| default_url(cfg))
+    };
+
+    Ok(ConnectResult {
+        outcomes,
+        key_origin,
+        agents_md,
+        dry_run: args.dry_run,
+        stdio: args.stdio,
+        oauth: args.oauth,
+        url,
+        transport,
+    })
+}
+
+/// Write (or render, under `--dry-run`) every selected client, minting each
+/// client's own key as it goes (LIF-259). Per-client key-minting/write failures
+/// and skips are recorded as outcomes so the run continues.
+fn write_all_clients(
+    selected: &[String],
+    args: &ConnectArgs,
+    cfg: &Config,
+    pool: &DbPool,
+    base: &PathBase,
+    key_source: Option<&KeySource>,
+) -> Vec<ClientOutcome> {
+    let mut outcomes = Vec::new();
+    for id in selected {
+        let Some(spec) = clients::find_client(id) else {
+            continue;
+        };
+
+        // --oauth: skip OAuth-incapable clients with an explanatory note rather
+        // than silently dropping them (LIF-259).
+        if args.oauth
+            && let OauthSupport::Unsupported { reason } = spec.oauth
+        {
+            outcomes.push(ClientOutcome {
+                id: id.clone(),
+                display: spec.display.to_string(),
+                format: spec.format.as_str().to_string(),
+                error: Some(format!(
+                    "{} does not support --oauth; skipped",
+                    spec.display
+                )),
+                notes: vec![reason.to_string()],
+                ..Default::default()
+            });
+            continue;
+        }
+
+        let Some(path) = spec.path_for(base, args.scope) else {
+            outcomes.push(ClientOutcome {
+                id: id.clone(),
+                display: spec.display.to_string(),
+                format: spec.format.as_str().to_string(),
+                error: Some(format!(
+                    "{} has no {}-scope config; skipped",
+                    spec.display,
+                    args.scope.as_str()
+                )),
+                ..Default::default()
+            });
+            continue;
+        };
+
+        // Mint this client's own key (per-tool). Only when a real remote write
+        // with minting is happening; stdio/oauth/dry-run supply their own.
+        let this_key = match key_source {
+            Some(source) => match mint_for_tool(source, &spec, pool) {
+                Ok(k) => Some(k),
+                Err(e) => {
+                    // Minting failed for this tool — record and keep going.
+                    outcomes.push(ClientOutcome {
+                        id: id.clone(),
+                        display: spec.display.to_string(),
+                        format: spec.format.as_str().to_string(),
+                        path: Some(path),
+                        error: Some(format!("key minting failed: {e}")),
+                        ..Default::default()
+                    });
+                    continue;
+                }
+            },
+            None => None,
+        };
+
+        let server = build_server_config(args, cfg, this_key.as_deref().unwrap_or(""));
+        let entry = spec.compile(&server);
+
+        // The per-client key we surface: none for stdio/oauth (no header key).
+        let out_key = if args.stdio || args.oauth {
+            None
+        } else {
+            this_key.clone()
+        };
+        let auth_hint = if args.oauth {
+            match spec.oauth {
+                OauthSupport::Capable { hint } => Some(hint.to_string()),
+                OauthSupport::Unsupported { .. } => None,
+            }
+        } else {
+            None
+        };
+
+        if args.dry_run {
+            match writer::render(&path, spec.format, &entry) {
+                Ok(rendered) => outcomes.push(ClientOutcome {
+                    id: id.clone(),
+                    display: spec.display.to_string(),
+                    format: spec.format.as_str().to_string(),
+                    path: Some(path),
+                    action: Some(rendered.action.as_str().to_string()),
+                    notes: entry.notes.clone(),
+                    dry_run_contents: Some(rendered.contents),
+                    key: out_key,
+                    auth_hint,
+                    ..Default::default()
+                }),
+                Err(e) => outcomes.push(ClientOutcome {
+                    id: id.clone(),
+                    display: spec.display.to_string(),
+                    format: spec.format.as_str().to_string(),
+                    path: Some(path),
+                    notes: entry.notes.clone(),
+                    error: Some(e.message.clone()),
+                    manual_snippet: e.manual_snippet,
+                    ..Default::default()
+                }),
+            }
+        } else {
+            match writer::write(&path, spec.format, &entry) {
+                Ok(action) => outcomes.push(ClientOutcome {
+                    id: id.clone(),
+                    display: spec.display.to_string(),
+                    format: spec.format.as_str().to_string(),
+                    path: Some(path),
+                    action: Some(action.as_str().to_string()),
+                    notes: entry.notes.clone(),
+                    key: out_key,
+                    auth_hint,
+                    ..Default::default()
+                }),
+                Err(e) => outcomes.push(ClientOutcome {
+                    id: id.clone(),
+                    display: spec.display.to_string(),
+                    format: spec.format.as_str().to_string(),
+                    path: Some(path),
+                    notes: entry.notes.clone(),
+                    error: Some(e.message.clone()),
+                    manual_snippet: e.manual_snippet,
+                    ..Default::default()
+                }),
+            }
+        }
+    }
+    outcomes
+}
+
+/// Decide whether and how to touch AGENTS.md for this run.
+///
+/// Only in project scope, or when cwd looks like a project (has `.git`).
+/// `--skip-agents` opts out silently. In interactive mode we'd ask; here the
+/// consent model is: with `--yes` (or `--skip-agents`) the decision is explicit,
+/// so in project scope with `--yes` we write it. Without a TTY and without
+/// `--yes`, we skip (don't hang, don't surprise-write).
+fn maybe_write_agents_md(
+    args: &ConnectArgs,
+    base: &PathBase,
+    stdin_tty: bool,
+) -> Result<Option<AgentsMdOutcome>, String> {
+    if args.skip_agents {
+        return Ok(None);
+    }
+    if args.dry_run {
+        return Ok(None);
+    }
+
+    let looks_like_project = args.scope == Scope::Project || base.project.join(".git").exists();
+    if !looks_like_project {
+        return Ok(None);
+    }
+
+    // Consent: explicit --yes writes; interactive TTY asks; otherwise skip.
+    let consented = if args.yes {
+        true
+    } else if stdin_tty {
+        cliclack::confirm(
+            "Write a Lific block into ./AGENTS.md so agents in this repo know about it?",
+        )
+        .initial_value(true)
+        .interact()
+        .unwrap_or(false)
+    } else {
+        false
+    };
+    if !consented {
+        return Ok(None);
+    }
+
+    let path = base.project.join("AGENTS.md");
+    let action = crate::cli::agents_md::write(&path, None)
+        .map_err(|e| format!("AGENTS.md update failed: {e}"))?;
+    Ok(Some(AgentsMdOutcome {
+        path,
+        action: action.as_str().to_string(),
+    }))
+}
+
+// ── Output rendering ─────────────────────────────────────────
+
+/// Render a run result to stdout, honoring `json`.
+pub fn print_result(result: &ConnectResult, json: bool) {
+    if json {
+        print_json(result);
+    } else {
+        print_human(result);
+    }
+}
+
+fn print_json(result: &ConnectResult) {
+    // LIF-259: keys are per-client now. Each client carries its own `key`
+    // (null for stdio/oauth/skipped) and, under --oauth, its `auth_hint`.
+    let clients: Vec<serde_json::Value> = result
+        .outcomes
+        .iter()
+        .map(|o| {
+            serde_json::json!({
+                "id": o.id,
+                "format": o.format,
+                "path": o.path.as_ref().map(|p| p.display().to_string()),
+                "action": o.action,
+                "notes": o.notes,
+                "error": o.error,
+                "manual_snippet": o.manual_snippet,
+                "contents": o.dry_run_contents,
+                "key": o.key,
+                "auth_hint": o.auth_hint,
+            })
+        })
+        .collect();
+    let out = serde_json::json!({
+        "clients": clients,
+        // Top-level key is always null now — keys live per-client above.
+        "key": serde_json::Value::Null,
+        "dry_run": result.dry_run,
+        "stdio": result.stdio,
+        "oauth": result.oauth,
+        "transport": result.transport.as_str(),
+        "url": result.url,
+        "agents_md": result.agents_md.as_ref().map(|a| serde_json::json!({
+            "path": a.path.display().to_string(),
+            "action": a.action,
+        })),
+    });
+    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+}
+
+fn print_human(result: &ConnectResult) {
+    use crate::cli::ui;
+
+    if result.dry_run {
+        ui::info("Dry run — no files were written.");
+    }
+    // LIFIC-19: surface the resolved transport so an interactive pick is never
+    // silent — the same choice a matching flag would have produced.
+    ui::step(format!("Transport: {}", ui::dim(result.transport.as_str())));
+    for o in &result.outcomes {
+        match (&o.action, &o.error) {
+            (Some(action), _) => {
+                let path = o
+                    .path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                ui::step(format!("{} — {action} {}", o.display, ui::dim(&path)));
+            }
+            (None, Some(err)) => {
+                ui::warn(format!("{} — skipped: {err}", o.display));
+                if let Some(snippet) = &o.manual_snippet {
+                    ui::note(format!("{} — merge this in manually", o.display), snippet);
+                }
+            }
+            (None, None) => {}
+        }
+        for note in &o.notes {
+            ui::info(note);
+        }
+        // LIF-259: this tool's own key right under its line.
+        if let Some(key) = &o.key {
+            // Codex reads its key from an env var — show the export for it.
+            let body = if o.id == "codex" {
+                format!("{key}\n\nexport LIFIC_API_KEY=\"{key}\"")
+            } else {
+                key.clone()
+            };
+            ui::note(format!("{} API key", o.display), body);
+        }
+        // --oauth: the client's native auth command instead of a key.
+        if let Some(hint) = &o.auth_hint {
+            ui::info(format!("Next: {}", ui::command(hint)));
+        }
+        if result.dry_run
+            && let Some(contents) = &o.dry_run_contents
+        {
+            let path = o
+                .path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            ui::note(path, contents.trim_end());
+        }
+    }
+
+    if let Some(a) = &result.agents_md {
+        ui::step(format!(
+            "AGENTS.md {} {}",
+            a.action,
+            ui::dim(a.path.display())
+        ));
+    }
+
+    // One consolidated warning when real keys were written (LIF-259).
+    let wrote_any_key = result.outcomes.iter().any(|o| o.key.is_some());
+    if wrote_any_key {
+        match result.key_origin {
+            Some(KeyOrigin::Provided) => {}
+            _ => {
+                ui::warn("Save the key(s) above now. They will never be shown again.");
+            }
+        }
+        if let Some(KeyOrigin::Unassigned) = result.key_origin {
+            ui::info(
+                "Unassigned keys — full access on this local instance. Create a user and \
+                 re-run --user <name> if you enable project authorization.",
+            );
+        }
+    }
+
+    ui::outro("Restart your client(s) to pick up the new MCP server.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+
+    fn cfg_with_port(port: u16) -> Config {
+        let mut c = Config::default();
+        c.server.port = port;
+        c
+    }
+
+    // ── ensure_instance_exists (the wrong-directory guard) ───────
+
+    #[test]
+    fn connect_refuses_when_database_does_not_exist() {
+        let guard = tmp();
+        let dir = guard.path();
+        std::fs::create_dir_all(dir).unwrap();
+        let mut cfg = Config::default();
+        cfg.database.path = dir.join("lific.db");
+        let err = ensure_instance_exists(&cfg).expect_err("must refuse a nonexistent db");
+        assert!(err.contains("does not exist"), "got: {err}");
+        assert!(err.contains("lific init"), "should point at init: {err}");
+    }
+
+    #[test]
+    fn connect_accepts_an_existing_database() {
+        let guard = tmp();
+        let dir = guard.path();
+        std::fs::create_dir_all(dir).unwrap();
+        let db_path = dir.join("lific.db");
+        std::fs::write(&db_path, b"").unwrap();
+        let mut cfg = Config::default();
+        cfg.database.path = db_path;
+        assert!(ensure_instance_exists(&cfg).is_ok());
+    }
+
+    // ── target_url ───────────────────────────────────────────────
+
+    #[test]
+    fn target_url_prefers_explicit_url_and_stdio_uses_db_path() {
+        let cfg = cfg_with_port(4000);
+        let mut args = ConnectArgs {
+            clients: vec![],
+            scope: Scope::Global,
+            stdio: false,
+            oauth: false,
+            url: Some("https://example.com/mcp".into()),
+            key: None,
+            user: None,
+            yes: true,
+            dry_run: false,
+            skip_agents: true,
+        };
+        assert_eq!(target_url(&args, &cfg), "https://example.com/mcp");
+        args.url = None;
+        assert_eq!(target_url(&args, &cfg), "http://127.0.0.1:4000/mcp");
+        args.stdio = true;
+        assert!(target_url(&args, &cfg).ends_with("lific.db"));
+    }
+
+    fn base(dir: &std::path::Path) -> PathBase {
+        PathBase {
+            home: dir.join("home"),
+            project: dir.join("proj"),
+            os: Os::Linux,
+            appdata: None,
+        }
+    }
+
+    /// Scratch directory for one test. Dropping the guard removes it, which
+    /// also runs while a failed assertion unwinds, so no run inherits state
+    /// from a previous one.
+    fn tmp() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    // ── default_url ──────────────────────────────────────────
+
+    #[test]
+    fn default_url_uses_loopback_and_port_not_bind_host() {
+        let c = cfg_with_port(9999);
+        assert_eq!(default_url(&c), "http://127.0.0.1:9999/mcp");
+    }
+
+    #[test]
+    fn default_url_prefers_public_url_and_appends_mcp() {
+        let mut c = Config::default();
+        c.server.public_url = Some("https://lific.example.com".into());
+        assert_eq!(default_url(&c), "https://lific.example.com/mcp");
+    }
+
+    #[test]
+    fn default_url_public_url_already_has_mcp() {
+        let mut c = Config::default();
+        c.server.public_url = Some("https://lific.example.com/mcp".into());
+        assert_eq!(default_url(&c), "https://lific.example.com/mcp");
+    }
+
+    // ── resolve_clients_inner ────────────────────────────────
+
+    fn no_picker(_: &[DetectedClient]) -> Result<Vec<String>, String> {
+        panic!("picker must not be called when --client is given or stdin is not a TTY");
+    }
+
+    #[test]
+    fn resolve_explicit_clients_validates_and_dedups() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let got = resolve_clients_inner(
+            &["opencode".into(), "codex".into(), "opencode".into()],
+            true,
+            &b,
+            Scope::Global,
+            no_picker,
+        )
+        .unwrap();
+        assert_eq!(got, vec!["opencode".to_string(), "codex".to_string()]);
+    }
+
+    #[test]
+    fn resolve_unknown_client_errors() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let err = resolve_clients_inner(&["nope".into()], true, &b, Scope::Global, no_picker)
+            .unwrap_err();
+        assert!(err.contains("unknown client"));
+    }
+
+    #[test]
+    fn resolve_no_client_non_tty_refuses_naming_flags() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let err = resolve_clients_inner(&[], false, &b, Scope::Global, no_picker).unwrap_err();
+        assert!(err.contains("--client"), "must name --client: {err}");
+        assert!(err.contains("--yes"), "must name --yes: {err}");
+    }
+
+    #[test]
+    fn resolve_no_client_tty_calls_picker() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let got =
+            resolve_clients_inner(&[], true, &b, Scope::Global, |_| Ok(vec!["cursor".into()]))
+                .unwrap();
+        assert_eq!(got, vec!["cursor".to_string()]);
+    }
+
+    // ── transport resolution (LIFIC-19) ──────────────────────
+
+    fn no_transport_picker() -> Result<TransportMode, String> {
+        panic!("picker must not be called when a transport flag is given or stdin is not a TTY")
+    }
+
+    #[test]
+    fn transport_stdio_flag_wins_without_picker() {
+        assert_eq!(
+            resolve_transport_inner(true, false, true, no_transport_picker).unwrap(),
+            TransportMode::Stdio
+        );
+        assert_eq!(
+            resolve_transport_inner(true, false, false, no_transport_picker).unwrap(),
+            TransportMode::Stdio
+        );
+    }
+
+    #[test]
+    fn transport_oauth_flag_wins_without_picker() {
+        assert_eq!(
+            resolve_transport_inner(false, true, true, no_transport_picker).unwrap(),
+            TransportMode::Oauth
+        );
+    }
+
+    #[test]
+    fn transport_non_tty_no_flag_defaults_to_remote() {
+        // The historical non-interactive default. No picker, no menu.
+        assert_eq!(
+            resolve_transport_inner(false, false, false, no_transport_picker).unwrap(),
+            TransportMode::Remote
+        );
+    }
+
+    #[test]
+    fn transport_tty_no_flag_calls_picker() {
+        let got = resolve_transport_inner(false, false, true, || Ok(TransportMode::Stdio)).unwrap();
+        assert_eq!(got, TransportMode::Stdio);
+        let got =
+            resolve_transport_inner(false, false, true, || Ok(TransportMode::Remote)).unwrap();
+        assert_eq!(got, TransportMode::Remote);
+        let got = resolve_transport_inner(false, false, true, || Ok(TransportMode::Oauth)).unwrap();
+        assert_eq!(got, TransportMode::Oauth);
+    }
+
+    #[test]
+    fn transport_labels_are_stable() {
+        assert_eq!(TransportMode::Stdio.as_str(), "stdio");
+        assert_eq!(TransportMode::Remote.as_str(), "remote");
+        assert_eq!(TransportMode::Oauth.as_str(), "oauth");
+    }
+
+    #[test]
+    fn run_remote_flag_and_nontty_default_agree() {
+        // LIFIC-19 AC: the interactive menu and the flag/non-interactive path
+        // must produce the same config for the same choice. Proving it at the
+        // seam: a non-TTY run (remote default) and an explicit --stdio run
+        // resolve to distinct transports, and the resolver decides them
+        // deterministically without a picker.
+        assert_eq!(
+            resolve_transport_inner(false, false, false, no_transport_picker).unwrap(),
+            TransportMode::Remote
+        );
+        assert_eq!(
+            resolve_transport_inner(false, false, true, || Ok(TransportMode::Remote)).unwrap(),
+            TransportMode::Remote
+        );
+    }
+
+    // ── detection ────────────────────────────────────────────
+
+    #[test]
+    fn detect_finds_only_present_clients() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        // Create ~/.cursor/ and ~/.codex/config.toml in the injected home.
+        std::fs::create_dir_all(b.home.join(".cursor")).unwrap();
+        std::fs::create_dir_all(b.home.join(".codex")).unwrap();
+        std::fs::write(b.home.join(".codex").join("config.toml"), "").unwrap();
+
+        let detected = detect_clients(&b, Scope::Global);
+        let by_id = |id: &str| detected.iter().find(|c| c.id == id).unwrap().detected;
+        assert!(by_id("cursor"), "cursor should be detected");
+        assert!(by_id("codex"), "codex should be detected");
+        assert!(!by_id("gemini"), "gemini should not be detected");
+        assert!(!by_id("windsurf"), "windsurf should not be detected");
+    }
+
+    // ── end-to-end run ───────────────────────────────────────
+
+    fn args(clients: &[&str], scope: Scope) -> ConnectArgs {
+        ConnectArgs {
+            clients: clients.iter().map(|s| s.to_string()).collect(),
+            scope,
+            stdio: false,
+            oauth: false,
+            url: Some("http://127.0.0.1:3456/mcp".into()),
+            key: Some("lific_sk-live-TESTKEY".into()),
+            user: None,
+            yes: true,
+            dry_run: false,
+            skip_agents: true,
+        }
+    }
+
+    /// A single user for tests that exercise per-tool bot minting.
+    fn seed_user(pool: &DbPool, username: &str, admin: bool) -> i64 {
+        let conn = pool.write().unwrap();
+        crate::db::queries::users::create_user(
+            &conn,
+            &crate::db::models::CreateUser {
+                username: username.into(),
+                email: format!("{username}@test.com"),
+                password: "testpassword1".into(),
+                display_name: None,
+                is_admin: admin,
+                is_bot: false,
+            },
+        )
+        .unwrap()
+        .id
+    }
+
+    fn seed_opencode_key(pool: &DbPool, expires_at: &str) -> i64 {
+        let owner_id = seed_user(pool, "solo", true);
+        let bot_id = {
+            let conn = pool.write().unwrap();
+            crate::db::queries::users::ensure_bot(&conn, owner_id, "opencode", "OpenCode")
+                .unwrap()
+                .id
+        };
+        crate::auth::create_api_key_with_expiry(
+            pool,
+            "opencode-solo",
+            Some(expires_at),
+            Some(bot_id),
+        )
+        .unwrap();
+        pool.read()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM api_keys WHERE name = 'opencode-solo' AND revoked = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn run_writes_project_scope_configs_and_skips_no_project_clients() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        let cfg = Config::default();
+        // goose has no project path → should be skipped with a warning.
+        let a = args(&["opencode", "codex", "goose"], Scope::Project);
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+
+        let oc = result.outcomes.iter().find(|o| o.id == "opencode").unwrap();
+        assert_eq!(oc.action.as_deref(), Some("created"));
+        assert_eq!(
+            oc.key.as_deref(),
+            Some("lific_sk-live-TESTKEY"),
+            "provided --key is used verbatim per client"
+        );
+        assert!(b.project.join("opencode.json").exists());
+
+        let cx = result.outcomes.iter().find(|o| o.id == "codex").unwrap();
+        assert_eq!(cx.action.as_deref(), Some("created"));
+        assert_eq!(cx.key.as_deref(), Some("lific_sk-live-TESTKEY"));
+        assert!(b.project.join(".codex/config.toml").exists());
+
+        let goose = result.outcomes.iter().find(|o| o.id == "goose").unwrap();
+        assert!(goose.action.is_none());
+        assert!(
+            goose.error.as_ref().unwrap().contains("project"),
+            "goose skip should mention project scope"
+        );
+    }
+
+    #[test]
+    fn run_stdio_writes_absolute_db_and_no_key() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.database.path = dir.join("mydb.db");
+        let mut a = args(&["opencode"], Scope::Project);
+        a.stdio = true;
+        a.key = None;
+
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+        // stdio needs no key: no per-client key on any outcome.
+        assert!(
+            result.outcomes.iter().all(|o| o.key.is_none()),
+            "stdio needs no key"
+        );
+
+        let written = std::fs::read_to_string(b.project.join("opencode.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(v["mcp"]["lific"]["type"], "local");
+        let cmd = v["mcp"]["lific"]["command"].as_array().unwrap();
+        // The db path is absolute.
+        let db_arg = cmd[2].as_str().unwrap();
+        assert!(
+            std::path::Path::new(db_arg).is_absolute(),
+            "stdio db path must be absolute, got {db_arg}"
+        );
+    }
+
+    // ── LIFIC-18: stdio agent token carrier ───────────────────────────────
+
+    #[test]
+    fn run_stdio_with_owner_mints_agent_key_written_into_env() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        let owner_id = seed_user(&pool, "solo", true);
+        let mut cfg = Config::default();
+        cfg.database.path = dir.join("mydb.db");
+        let mut a = args(&["opencode"], Scope::Project);
+        a.stdio = true;
+        a.key = None;
+
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+
+        // The outcome carries no bearer key (stdio surfaces none), but the
+        // config MUST carry the minted agent token in the env field.
+        assert!(result.outcomes.iter().all(|o| o.key.is_none()));
+
+        let written = std::fs::read_to_string(b.project.join("opencode.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(v["mcp"]["lific"]["type"], "local");
+        let token = v["mcp"]["lific"]["environment"]["LIFIC_TOKEN"]
+            .as_str()
+            .expect("stdio config must write LIFIC_TOKEN into environment");
+        assert!(token.starts_with("lific_sk-live-"), "got {token}");
+
+        // The bot was minted as the per-tool agent owned by the operator.
+        let conn = pool.read().unwrap();
+        let (is_bot, owner): (bool, Option<i64>) = conn
+            .query_row(
+                "SELECT is_bot, owner_id FROM users WHERE username = 'opencode-solo'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(is_bot, "opencode-solo must be a bot");
+        assert_eq!(owner, Some(owner_id), "bot must be owned by the operator");
+    }
+
+    #[test]
+    fn run_stdio_openconfig_merges_with_existing_entries() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        seed_user(&pool, "solo", true);
+        let mut cfg = Config::default();
+        cfg.database.path = dir.join("mydb.db");
+        std::fs::create_dir_all(b.project.clone()).unwrap();
+        std::fs::write(
+            b.project.join("opencode.json"),
+            r#"{ "mcp": { "other": { "type": "remote", "url": "http://other" } } }"#,
+        )
+        .unwrap();
+        let mut a = args(&["opencode"], Scope::Project);
+        a.stdio = true;
+        a.key = None;
+
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+        assert_eq!(result.outcomes[0].action.as_deref(), Some("updated"));
+
+        let written = std::fs::read_to_string(b.project.join("opencode.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        // Unrelated entries survive.
+        assert_eq!(v["mcp"]["other"]["url"], "http://other");
+        // Lific entry has the stdio command + token env.
+        assert_eq!(v["mcp"]["lific"]["type"], "local");
+        assert!(
+            v["mcp"]["lific"]["environment"]["LIFIC_TOKEN"]
+                .as_str()
+                .is_some()
+        );
+    }
+
+    // ── connect idempotency / self-healing the stdio token ────────────────
+    //
+    // If a stdio config already lists `lific` but is MISSING the token (e.g. it
+    // was written by a pre-token connect, or the env field was damaged), a
+    // re-run of `connect --stdio` must mint a token and repair the entry in
+    // place — reusing the same agent bot, keeping one active key, and not
+    // corrupting other entries.
+
+    #[test]
+    fn run_stdio_reconnects_and_heals_a_tokenless_lific_entry() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        seed_user(&pool, "solo", true);
+        let mut cfg = Config::default();
+        cfg.database.path = dir.join("mydb.db");
+        std::fs::create_dir_all(b.project.clone()).unwrap();
+        // A pre-existing stdio entry with NO environment/token, plus a sibling.
+        std::fs::write(
+            b.project.join("opencode.json"),
+            r#"{ "mcp": { "lific": { "type": "local", "command": ["lific", "--db", "/abs/lific.db", "mcp"] }, "other": { "type": "remote" } } }"#,
+        )
+        .unwrap();
+        let mut a = args(&["opencode"], Scope::Project);
+        a.stdio = true;
+        a.key = None;
+
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+        assert_eq!(result.outcomes[0].action.as_deref(), Some("updated"));
+
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(b.project.join("opencode.json")).unwrap(),
+        )
+        .unwrap();
+        // Lific entry healed: command kept, token env added.
+        assert_eq!(v["mcp"]["lific"]["type"], "local");
+        assert_eq!(
+            v["mcp"]["lific"]["command"],
+            serde_json::json!([
+                "lific",
+                "--db",
+                dir.join("mydb.db").display().to_string(),
+                "mcp"
+            ])
+        );
+        let token = v["mcp"]["lific"]["environment"]["LIFIC_TOKEN"]
+            .as_str()
+            .expect("reconnect must write LIFIC_TOKEN");
+        assert!(token.starts_with("lific_sk-live-"));
+
+        // Sibling preserved.
+        assert_eq!(v["mcp"]["other"]["type"], "remote");
+
+        // The same agent bot is reused, not duplicated.
+        let conn = pool.read().unwrap();
+        let bots: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM users WHERE username = 'opencode-solo'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bots, 1, "reconnect must not duplicate the agent bot");
+        assert_eq!(active_key_count(&pool, "opencode-solo"), 1);
+    }
+
+    #[test]
+    fn run_stdio_rerun_keeps_the_token_and_agent_stable() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        seed_user(&pool, "solo", true);
+        let mut cfg = Config::default();
+        cfg.database.path = dir.join("mydb.db");
+        let mut a = args(&["opencode"], Scope::Project);
+        a.stdio = true;
+        a.key = None;
+
+        let _ = run(&a, &cfg, &pool, &b).unwrap();
+        // Fresh connect run #2 must already be up-to-date and idempotent w.r.t.
+        // the DB state: same single bot, single active key, a valid token write.
+        let _ = run(&a, &cfg, &pool, &b).unwrap();
+        let conn = pool.read().unwrap();
+        let bots: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM users WHERE username = 'opencode-solo'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let keys: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM api_keys WHERE name = 'opencode-solo' AND revoked = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bots, 1, "no agent churn across reruns");
+        assert_eq!(keys, 1, "exactly one active key across reruns");
+
+        // The config remains well-formed and carries a live token after run #2
+        // (a re-connect may rotate the key — that is a valid fresh plaintext).
+        let second_v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(b.project.join("opencode.json")).unwrap(),
+        )
+        .unwrap();
+        let second_token = second_v["mcp"]["lific"]["environment"]["LIFIC_TOKEN"]
+            .as_str()
+            .expect("token must be present after rerun");
+        assert!(second_token.starts_with("lific_sk-live-"));
+        assert_eq!(second_v["mcp"]["lific"]["type"], "local");
+    }
+
+    #[test]
+    fn run_stdio_codex_writes_env_table_in_toml() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        seed_user(&pool, "solo", true);
+        let mut cfg = Config::default();
+        cfg.database.path = dir.join("mydb.db");
+        let mut a = args(&["codex"], Scope::Project);
+        a.stdio = true;
+        a.key = None;
+
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+        let outcome = &result.outcomes[0];
+        assert_eq!(
+            outcome.action.as_deref(),
+            Some("created"),
+            "codex stdio error: {:?}",
+            outcome.error
+        );
+
+        let written = std::fs::read_to_string(b.project.join(".codex/config.toml")).unwrap();
+        // The stdio command and the env table with LIFIC_TOKEN both land.
+        assert!(
+            written.contains("command = \"lific\""),
+            "codex stdio must keep the lific command:\n{written}"
+        );
+        assert!(
+            written.contains("args = [\"--db\""),
+            "codex stdio must keep the db args:\n{written}"
+        );
+        assert!(
+            written.contains("LIFIC_TOKEN"),
+            "codex stdio must write LIFIC_TOKEN into env:\n{written}"
+        );
+        assert!(
+            written.contains("lific_sk-live-"),
+            "codex must carry a real minted key, not a placeholder:\n{written}"
+        );
+    }
+
+    #[test]
+    fn run_stdio_codex_env_merges_into_existing_config() {
+        // LIFIC-18 spec: "The config write merges into an existing tool config
+        // without destroying other entries." opencode covered it; this pins the
+        // codex TOML merge path, which touches a different writer branch.
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        seed_user(&pool, "solo", true);
+        let mut cfg = Config::default();
+        cfg.database.path = dir.join("mydb.db");
+        std::fs::create_dir_all(b.project.join(".codex")).unwrap();
+        std::fs::write(
+            b.project.join(".codex/config.toml"),
+            "model = \"gpt-5\"\n\n[mcp_servers.other]\nurl = \"http://other\"\n",
+        )
+        .unwrap();
+        let mut a = args(&["codex"], Scope::Project);
+        a.stdio = true;
+        a.key = None;
+
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+        assert_eq!(result.outcomes[0].action.as_deref(), Some("updated"));
+
+        let written = std::fs::read_to_string(b.project.join(".codex/config.toml")).unwrap();
+        // Unrelated config survives.
+        assert!(
+            written.contains("model = \"gpt-5\""),
+            "user's model setting must survive:\n{written}"
+        );
+        assert!(
+            written.contains("[mcp_servers.other]"),
+            "unrelated server table must survive:\n{written}"
+        );
+        assert!(
+            written.contains("url = \"http://other\""),
+            "unrelated server's url must survive:\n{written}"
+        );
+        // Our entry: stdio command + token env.
+        assert!(
+            written.contains("command = \"lific\""),
+            "codex lific command must be present:\n{written}"
+        );
+        assert!(
+            written.contains("LIFIC_TOKEN"),
+            "codex must write LIFIC_TOKEN into env on merge:\n{written}"
+        );
+    }
+
+    #[test]
+    fn run_dry_run_writes_nothing_but_returns_contents() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        let cfg = Config::default();
+        let mut a = args(&["cursor"], Scope::Global);
+        a.dry_run = true;
+
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+        let oc = &result.outcomes[0];
+        assert!(oc.dry_run_contents.is_some());
+        // Nothing on disk.
+        assert!(!b.home.join(".cursor/mcp.json").exists());
+    }
+
+    // ── per-tool key minting (LIF-259) ───────────────────────
+
+    /// Count active (unrevoked) keys with a given name.
+    fn active_key_count(pool: &DbPool, name: &str) -> i64 {
+        let conn = pool.read().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM api_keys WHERE name = ?1 AND revoked = 0",
+            rusqlite::params![name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolve_key_source_provided_is_verbatim() {
+        let pool = db::open_memory().unwrap();
+        let a = args(&["opencode"], Scope::Global); // provides --key
+        match resolve_key_source(&a, &pool).unwrap() {
+            KeySource::Provided(k) => assert_eq!(k, "lific_sk-live-TESTKEY"),
+            _ => panic!("expected Provided"),
+        }
+    }
+
+    #[test]
+    fn provided_key_is_used_verbatim_for_all_clients() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        let cfg = Config::default();
+        // Two clients, one shared --key: both get the SAME verbatim key.
+        let a = args(&["opencode", "cursor"], Scope::Global);
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+        for id in ["opencode", "cursor"] {
+            let oc = result.outcomes.iter().find(|o| o.id == id).unwrap();
+            assert_eq!(oc.key.as_deref(), Some("lific_sk-live-TESTKEY"));
+        }
+        // Nothing was minted (no bots, no keys in the DB).
+        let conn = pool.read().unwrap();
+        let key_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM api_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(key_count, 0, "--key mints nothing");
+    }
+
+    #[test]
+    fn fresh_install_mints_per_tool_unassigned_keys() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap(); // zero users
+        let cfg = Config::default();
+        let mut a = args(&["opencode", "cursor"], Scope::Global);
+        a.key = None; // force minting
+
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+        assert_eq!(result.key_origin, Some(KeyOrigin::Unassigned));
+
+        let oc = result.outcomes.iter().find(|o| o.id == "opencode").unwrap();
+        let cur = result.outcomes.iter().find(|o| o.id == "cursor").unwrap();
+        let ock = oc.key.clone().unwrap();
+        let curk = cur.key.clone().unwrap();
+        assert!(ock.starts_with("lific_sk-live-"));
+        assert!(curk.starts_with("lific_sk-live-"));
+        assert_ne!(ock, curk, "each tool gets a distinct key");
+
+        // Keys are named just after the tool, and unassigned (user_id NULL).
+        let conn = pool.read().unwrap();
+        for name in ["opencode", "cursor"] {
+            let uid: Option<i64> = conn
+                .query_row(
+                    "SELECT user_id FROM api_keys WHERE name = ?1",
+                    rusqlite::params![name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(uid, None, "{name} key must be unassigned");
+        }
+        // Each config file contains its own key.
+        let oc_body =
+            std::fs::read_to_string(b.home.join(".config/opencode/opencode.json")).unwrap();
+        assert!(oc_body.contains(&ock));
+        let cur_body = std::fs::read_to_string(b.home.join(".cursor/mcp.json")).unwrap();
+        assert!(cur_body.contains(&curk));
+    }
+
+    #[test]
+    fn single_user_mints_per_tool_bots_owned_by_them() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        let owner_id = seed_user(&pool, "solo", true);
+        let cfg = Config::default();
+        let mut a = args(&["opencode", "cursor"], Scope::Global);
+        a.key = None;
+
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+        assert_eq!(result.key_origin, Some(KeyOrigin::Bot));
+
+        let ock = result
+            .outcomes
+            .iter()
+            .find(|o| o.id == "opencode")
+            .unwrap()
+            .key
+            .clone()
+            .unwrap();
+        let curk = result
+            .outcomes
+            .iter()
+            .find(|o| o.id == "cursor")
+            .unwrap()
+            .key
+            .clone()
+            .unwrap();
+        assert_ne!(ock, curk, "each tool gets a distinct plaintext");
+
+        let conn = pool.read().unwrap();
+        // Two bots: `opencode-solo` and `cursor-solo`, correct display names,
+        // owned by the human.
+        for (username, display) in [("opencode-solo", "OpenCode"), ("cursor-solo", "Cursor")] {
+            let (is_bot, owner, dn): (bool, Option<i64>, String) = conn
+                .query_row(
+                    "SELECT is_bot, owner_id, display_name FROM users WHERE username = ?1",
+                    rusqlite::params![username],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert!(is_bot, "{username} must be a bot");
+            assert_eq!(owner, Some(owner_id), "{username} must be owned by solo");
+            assert_eq!(dn, display, "{username} display name must match web UI");
+        }
+        // One active key per bot, each assigned to the right bot.
+        assert_eq!(active_key_count(&pool, "opencode-solo"), 1);
+        assert_eq!(active_key_count(&pool, "cursor-solo"), 1);
+    }
+
+    #[test]
+    fn rerun_rotates_both_tool_keys_without_error() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        seed_user(&pool, "solo", true);
+        let cfg = Config::default();
+        let mut a = args(&["opencode", "cursor"], Scope::Global);
+        a.key = None;
+
+        let first = run(&a, &cfg, &pool, &b).unwrap();
+        let ock1 = first
+            .outcomes
+            .iter()
+            .find(|o| o.id == "opencode")
+            .unwrap()
+            .key
+            .clone()
+            .unwrap();
+
+        // Re-run: must succeed and rotate (fresh plaintext), still one active
+        // key per bot.
+        let second = run(&a, &cfg, &pool, &b).unwrap();
+        let ock2 = second
+            .outcomes
+            .iter()
+            .find(|o| o.id == "opencode")
+            .unwrap()
+            .key
+            .clone()
+            .unwrap();
+        assert_ne!(ock1, ock2, "re-run must rotate the opencode key");
+        assert_eq!(active_key_count(&pool, "opencode-solo"), 1);
+        assert_eq!(active_key_count(&pool, "cursor-solo"), 1);
+    }
+
+    fn assert_expired_key_reconnect_does_not_write_config(stdio: bool) {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        let existing_key_id = seed_opencode_key(&pool, "2000-01-01T00:00:00Z");
+        let cfg = Config::default();
+        let config_path = b.home.join(".config/opencode/opencode.json");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let initial_config = if stdio {
+            r#"{ "mcp": { "lific": { "type": "local", "environment": { "LIFIC_TOKEN": "expired" } }, "other": { "type": "remote" } } }"#
+        } else {
+            r#"{ "mcp": { "lific": { "type": "remote", "url": "http://old/mcp", "headers": { "Authorization": "Bearer expired" } }, "other": { "type": "remote" } } }"#
+        };
+        std::fs::write(&config_path, initial_config).unwrap();
+
+        let mut a = args(&["opencode"], Scope::Global);
+        a.key = None;
+        a.stdio = stdio;
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+
+        let outcome = &result.outcomes[0];
+        assert!(
+            outcome.action.is_none(),
+            "expired key must not be installed"
+        );
+        let error = outcome
+            .error
+            .as_deref()
+            .expect("expired key must be reported");
+        assert!(error.contains("expired"), "got: {error}");
+        assert!(error.contains("opencode-solo"), "got: {error}");
+        assert!(error.contains("lific key revoke"), "got: {error}");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            initial_config
+        );
+        assert_eq!(active_key_count(&pool, "opencode-solo"), 1);
+        let current_key_id = pool
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM api_keys WHERE name = 'opencode-solo' AND revoked = 0",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            current_key_id, existing_key_id,
+            "expired key is not replaced"
+        );
+    }
+
+    #[test]
+    fn run_remote_rejects_expired_tool_key_without_overwriting_config() {
+        assert_expired_key_reconnect_does_not_write_config(false);
+    }
+
+    #[test]
+    fn run_stdio_rejects_expired_tool_key_without_overwriting_config() {
+        assert_expired_key_reconnect_does_not_write_config(true);
+    }
+
+    #[test]
+    fn run_reconnect_rotates_future_expiring_key_and_preserves_expiry() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        let expires_at = "2999-12-31T23:59:59Z";
+        let old_key_id = seed_opencode_key(&pool, expires_at);
+        let cfg = Config::default();
+        let config_path = b.home.join(".config/opencode/opencode.json");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config_path,
+            r#"{ "mcp": { "lific": { "type": "remote", "url": "http://old/mcp", "headers": { "Authorization": "Bearer stale" } } } }"#,
+        )
+        .unwrap();
+        let mut a = args(&["opencode"], Scope::Global);
+        a.key = None;
+
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+
+        let outcome = &result.outcomes[0];
+        let token = outcome.key.as_deref().expect("future key is returned");
+        assert!(outcome.error.is_none(), "got: {:?}", outcome.error);
+        assert_eq!(outcome.action.as_deref(), Some("updated"));
+        assert!(token.starts_with("lific_sk-live-"));
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            written["mcp"]["lific"]["headers"]["Authorization"],
+            format!("Bearer {token}")
+        );
+        let stored_expiry = pool
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT expires_at FROM api_keys WHERE name = 'opencode-solo' AND revoked = 0",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap();
+        assert_eq!(stored_expiry.as_deref(), Some(expires_at));
+        let new_key_id = pool
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM api_keys WHERE name = 'opencode-solo' AND revoked = 0",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_ne!(new_key_id, old_key_id, "future key was rotated");
+    }
+
+    // ── reconnect healing, all transports (idempotency) ────────────────────
+    //
+    // The same self-healing expectation as the stdio case, applied to remote
+    // (API-key) and OAuth: re-running connect over an existing lific entry
+    // repairs it in place, mints/asserts the right credential state, reuses the
+    // agent bot, and never duplicates entries or keys.
+
+    #[test]
+    fn run_remote_reconnects_and_heals_a_stale_lific_entry() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        seed_user(&pool, "solo", true);
+        let cfg = Config::default();
+        std::fs::create_dir_all(b.home.join(".config/opencode")).unwrap();
+        // A pre-existing **remote** (API-key) entry pointing at a stale URL with
+        // a bogus key that no longer exists in the DB.
+        std::fs::write(
+            b.home.join(".config/opencode/opencode.json"),
+            r#"{ "mcp": { "lific": { "type": "remote", "url": "http://stale/mcp", "headers": { "Authorization": "Bearer lific_sk-live-STALE" } } } }"#,
+        )
+        .unwrap();
+        let mut a = args(&["opencode"], Scope::Global);
+        a.key = None;
+        a.url = Some("http://127.0.0.1:3456/mcp".into());
+
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+        assert_eq!(result.outcomes[0].action.as_deref(), Some("updated"));
+
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(b.home.join(".config/opencode/opencode.json")).unwrap(),
+        )
+        .unwrap();
+        // Healed: url corrected, a real minted key present.
+        assert_eq!(v["mcp"]["lific"]["url"], "http://127.0.0.1:3456/mcp");
+        let auth = v["mcp"]["lific"]["headers"]["Authorization"]
+            .as_str()
+            .expect("remote reconnect must write an Authorization header");
+        assert!(auth.starts_with("Bearer lific_sk-live-"), "got {auth}");
+
+        // The stale key is gone; one live bot key remains; one agent bot.
+        assert_eq!(active_key_count(&pool, "opencode-solo"), 1);
+        let conn = pool.read().unwrap();
+        let bots: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM users WHERE username = 'opencode-solo'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bots, 1, "remote reconnect must not duplicate the bot");
+    }
+
+    #[test]
+    fn run_oauth_reconnects_and_heals_a_stale_lific_entry() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        seed_user(&pool, "solo", true);
+        let cfg = Config::default();
+        std::fs::create_dir_all(b.home.join(".config/opencode")).unwrap();
+        // A pre-existing entry with a wrong URL and a stale bearer header.
+        std::fs::write(
+            b.home.join(".config/opencode/opencode.json"),
+            r#"{ "mcp": { "lific": { "type": "remote", "url": "http://old/", "headers": { "Authorization": "Bearer gone" } } } }"#,
+        )
+        .unwrap();
+        let mut a = args(&["opencode"], Scope::Global);
+        a.key = None;
+        a.oauth = true;
+        a.url = Some("http://127.0.0.1:3456/mcp".into());
+
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+        assert_eq!(result.outcomes[0].action.as_deref(), Some("updated"));
+
+        // Healed: correct URL and NO headers (OAuth headerless).
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(b.home.join(".config/opencode/opencode.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["mcp"]["lific"]["url"], "http://127.0.0.1:3456/mcp");
+        assert!(
+            v["mcp"]["lific"].get("headers").is_none(),
+            "oauth reconnect must drop the stale Authorization header"
+        );
+
+        // OAuth mints nothing, so the DB stays untouched.
+        let conn = pool.read().unwrap();
+        let keys: i64 = conn
+            .query_row("SELECT COUNT(*) FROM api_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(keys, 0, "oauth reconnects mint no keys");
+    }
+
+    #[test]
+    fn explicit_user_owns_the_bots() {
+        let pool = db::open_memory().unwrap();
+        let alice = seed_user(&pool, "alice", false);
+        let _bob = seed_user(&pool, "bob", false);
+
+        let mut a = args(&["opencode"], Scope::Global);
+        a.key = None;
+        a.user = Some("alice".into());
+
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let cfg = Config::default();
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+        assert_eq!(result.key_origin, Some(KeyOrigin::Bot));
+
+        let conn = pool.read().unwrap();
+        let owner: Option<i64> = conn
+            .query_row(
+                "SELECT owner_id FROM users WHERE username = 'opencode-alice'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, Some(alice), "explicit --user must own the bot");
+    }
+
+    #[test]
+    fn multiple_users_no_user_flag_errors_with_guidance() {
+        let pool = db::open_memory().unwrap();
+        seed_user(&pool, "a", false);
+        seed_user(&pool, "b", false);
+        let mut a = args(&["opencode"], Scope::Global);
+        a.key = None;
+        let err = resolve_key_source(&a, &pool).unwrap_err();
+        assert!(err.contains("--user"), "must guide toward --user: {err}");
+    }
+
+    #[test]
+    fn run_stdio_with_ambiguity_degrades_to_plain_config_not_error() {
+        // LIFIC-19 review fix: a non-interactive `--stdio` on a multi-user box
+        // (no --user) must NOT hard-fail just because the agent owner can't be
+        // resolved. A stdio config with no token runs as the operator, which is
+        // the documented LIFIC-18 fallback — so the run succeeds and writes a
+        // plain (token-less) stdio config.
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        seed_user(&pool, "a", false);
+        seed_user(&pool, "b", false); // two humans, no single owner, no --user
+        let mut cfg = Config::default();
+        cfg.database.path = dir.join("mydb.db");
+        let mut a = args(&["opencode"], Scope::Project);
+        a.stdio = true;
+        a.key = None;
+
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+        // The run succeeds and the config is written.
+        let oc = result.outcomes.iter().find(|o| o.id == "opencode").unwrap();
+        assert_eq!(oc.action.as_deref(), Some("created"));
+
+        // Plain stdio config: command present, but NO token (no env field,
+        // because no owner resolved → no LIFIC_TOKEN to bind).
+        let written = std::fs::read_to_string(b.project.join("opencode.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(v["mcp"]["lific"]["type"], "local");
+        assert_eq!(
+            v["mcp"]["lific"]["command"],
+            serde_json::json!([
+                "lific",
+                "--db",
+                dir.join("mydb.db").display().to_string(),
+                "mcp"
+            ])
+        );
+        assert!(
+            v["mcp"]["lific"].get("environment").is_none(),
+            "ambiguous-owner stdio must write no token env field"
+        );
+    }
+
+    // ── --oauth mode (LIF-259) ───────────────────────────────
+
+    #[test]
+    fn oauth_writes_headerless_opencode_and_mints_nothing() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        seed_user(&pool, "solo", true); // a human exists — must still not mint
+        let cfg = Config::default();
+        let mut a = args(&["opencode"], Scope::Global);
+        a.key = None;
+        a.oauth = true;
+
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+        assert!(result.oauth);
+
+        let oc = result.outcomes.iter().find(|o| o.id == "opencode").unwrap();
+        assert_eq!(oc.action.as_deref(), Some("created"));
+        assert!(oc.key.is_none(), "oauth writes no key");
+        assert_eq!(oc.auth_hint.as_deref(), Some("opencode mcp auth lific"));
+
+        // The written config has a url and NO headers key at all.
+        let body = std::fs::read_to_string(b.home.join(".config/opencode/opencode.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["mcp"]["lific"]["url"], "http://127.0.0.1:3456/mcp");
+        assert!(
+            v["mcp"]["lific"].get("headers").is_none(),
+            "oauth opencode config must have no headers key: {body}"
+        );
+
+        // Zero keys and zero bots created.
+        let conn = pool.read().unwrap();
+        let keys: i64 = conn
+            .query_row("SELECT COUNT(*) FROM api_keys", [], |r| r.get(0))
+            .unwrap();
+        let bots: i64 = conn
+            .query_row("SELECT COUNT(*) FROM users WHERE is_bot = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(keys, 0, "oauth mints no keys");
+        assert_eq!(bots, 0, "oauth creates no bots");
+    }
+
+    #[test]
+    fn oauth_codex_toml_has_url_and_no_bearer_env_var() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        let cfg = Config::default();
+        let mut a = args(&["codex"], Scope::Global);
+        a.key = None;
+        a.oauth = true;
+
+        run(&a, &cfg, &pool, &b).unwrap();
+        let body = std::fs::read_to_string(b.home.join(".codex/config.toml")).unwrap();
+        let doc: toml_edit::DocumentMut = body.parse().unwrap();
+        assert_eq!(
+            doc["mcp_servers"]["lific"]["url"].as_str(),
+            Some("http://127.0.0.1:3456/mcp")
+        );
+        assert!(
+            doc["mcp_servers"]["lific"]
+                .get("bearer_token_env_var")
+                .is_none(),
+            "oauth codex must not set bearer_token_env_var: {body}"
+        );
+    }
+
+    #[test]
+    fn oauth_skips_incapable_clients_with_note() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        let cfg = Config::default();
+        let mut a = args(&["opencode", "goose", "claude-desktop"], Scope::Global);
+        a.key = None;
+        a.oauth = true;
+
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+        for id in ["goose", "claude-desktop"] {
+            let oc = result.outcomes.iter().find(|o| o.id == id).unwrap();
+            assert!(oc.action.is_none(), "{id} must be skipped, not written");
+            assert!(
+                oc.error
+                    .as_ref()
+                    .unwrap()
+                    .contains("does not support --oauth"),
+                "{id} skip must explain why"
+            );
+            assert!(!oc.notes.is_empty(), "{id} must carry an explanatory note");
+        }
+        // opencode still went through.
+        let oc = result.outcomes.iter().find(|o| o.id == "opencode").unwrap();
+        assert_eq!(oc.action.as_deref(), Some("created"));
+    }
+
+    #[test]
+    fn oauth_and_stdio_conflict_errors() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        let cfg = Config::default();
+        let mut a = args(&["opencode"], Scope::Global);
+        a.key = None;
+        a.oauth = true;
+        a.stdio = true;
+        let err = run(&a, &cfg, &pool, &b).unwrap_err();
+        assert!(err.contains("--oauth") && err.contains("--stdio"));
+    }
+
+    #[test]
+    fn oauth_and_key_conflict_errors() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        let pool = db::open_memory().unwrap();
+        let cfg = Config::default();
+        let mut a = args(&["opencode"], Scope::Global); // provides --key
+        a.oauth = true;
+        let err = run(&a, &cfg, &pool, &b).unwrap_err();
+        assert!(err.contains("--oauth") && err.contains("--key"));
+    }
+
+    // ── AGENTS.md integration ────────────────────────────────
+
+    #[test]
+    fn run_writes_agents_md_in_project_scope_when_yes() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        std::fs::create_dir_all(&b.project).unwrap();
+        let pool = db::open_memory().unwrap();
+        let cfg = Config::default();
+        let mut a = args(&["opencode"], Scope::Project);
+        a.skip_agents = false; // allow it
+
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+        assert!(result.agents_md.is_some());
+        assert!(b.project.join("AGENTS.md").exists());
+        let content = std::fs::read_to_string(b.project.join("AGENTS.md")).unwrap();
+        assert!(content.contains("lific:begin"));
+    }
+
+    #[test]
+    fn run_skip_agents_writes_no_agents_md() {
+        let guard = tmp();
+        let dir = guard.path();
+        let b = base(dir);
+        std::fs::create_dir_all(&b.project).unwrap();
+        let pool = db::open_memory().unwrap();
+        let cfg = Config::default();
+        let a = args(&["opencode"], Scope::Project); // skip_agents = true
+        let result = run(&a, &cfg, &pool, &b).unwrap();
+        assert!(result.agents_md.is_none());
+        assert!(!b.project.join("AGENTS.md").exists());
+    }
+}

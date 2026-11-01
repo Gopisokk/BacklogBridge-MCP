@@ -1,0 +1,128 @@
+//! `lific key <action>`: mint, list, revoke, rotate, and assign API keys.
+
+use crate::auth;
+use crate::cli::{KeyAction, term, ui};
+use crate::config::Config;
+use crate::db;
+
+pub fn run(
+    cfg: &Config,
+    action: KeyAction,
+    json_flag: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let json = term::wants_json(json_flag);
+    let pool = db::open(&cfg.database.path)?;
+
+    match action {
+        KeyAction::Create {
+            name,
+            user,
+            expires,
+        } => {
+            // LIF-391: resolve --user first, so the key is created already
+            // bound and an unknown username fails before any key exists.
+            let owner = if let Some(ref username) = user {
+                let conn = pool.read()?;
+                Some(db::queries::users::get_user_by_username(&conn, username)?.id)
+            } else {
+                None
+            };
+            let key = auth::create_api_key_with_expiry(&pool, &name, expires.as_deref(), owner)?;
+            let assigned = user;
+
+            if json {
+                let out = serde_json::json!({
+                    "name": name,
+                    "key": key,
+                    "user": assigned,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                let title = if let Some(ref username) = assigned {
+                    format!(
+                        "API key '{name}' created (assigned to {username}) — save it now, it will not be shown again"
+                    )
+                } else {
+                    format!("API key '{name}' created — save it now, it will not be shown again")
+                };
+                ui::note(
+                    title,
+                    format!("{key}\n\nUse it as: Authorization: Bearer <key>"),
+                );
+            }
+        }
+        KeyAction::List => {
+            let keys = auth::list_api_keys(&pool)?;
+            if json {
+                let out: Vec<_> = keys
+                    .iter()
+                    .map(|k| {
+                        serde_json::json!({
+                            "name": k.name,
+                            "revoked": k.revoked,
+                            "created_at": k.created_at,
+                            "expires_at": k.expires_at,
+                            "unsupported_format": k.unsupported_format,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else if keys.is_empty() {
+                println!("No API keys configured.");
+            } else {
+                println!("{} API key(s):", keys.len());
+                for k in &keys {
+                    let status = if k.revoked { "REVOKED" } else { "active" };
+                    let expiry = k.expires_at.as_deref().unwrap_or("never");
+                    println!(
+                        "  {} | {} | created {} | expires {}{}",
+                        k.name,
+                        status,
+                        k.created_at,
+                        expiry,
+                        if k.unsupported_format {
+                            " | UNSUPPORTED FORMAT (rotate before reuse)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+        }
+        KeyAction::Revoke { name } => {
+            auth::revoke_api_key(&pool, &name)?;
+            if json {
+                let out = serde_json::json!({ "revoked": name });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                ui::step(format!("Revoked key '{name}'"));
+            }
+        }
+        KeyAction::Rotate { name } => {
+            let key = auth::rotate_api_key(&pool, &name)?;
+            if json {
+                let out = serde_json::json!({ "name": name, "key": key });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                ui::note(
+                    format!("Key '{name}' rotated — save it now, it will not be shown again"),
+                    &key,
+                );
+            }
+        }
+        KeyAction::Assign { name, user } => {
+            let conn = pool.read()?;
+            let u = db::queries::users::get_user_by_username(&conn, &user)?;
+            drop(conn);
+            let conn = pool.write()?;
+            db::queries::users::assign_key_to_user(&conn, &name, u.id)?;
+            if json {
+                let out = serde_json::json!({ "name": name, "user": user });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                ui::step(format!("Assigned key '{name}' to user '{user}'"));
+            }
+        }
+    }
+    Ok(())
+}
